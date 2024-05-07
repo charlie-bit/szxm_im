@@ -18,7 +18,7 @@
 #
 
 set -e
-set -o pipefail
+
 
 ############################## OpenIM Github ##############################
 # ... rest of the script ...
@@ -40,7 +40,7 @@ REPO="Open-IM-Server"
 
 # Version of Go you want to use, make sure it is compatible with your OpenIM-Server requirements.
 # Default is 1.18, if you want to use a different version, replace accordingly.
-GO_VERSION="1.18"
+GO_VERSION="1.20"
 
 # Default HTTP_PORT is 80. If you want to use a different port, uncomment and replace the value.
 # HTTP_PORT=80
@@ -63,7 +63,7 @@ PROXY=
 GITHUB_TOKEN=
 
 # Default user is "root". If you need to modify it, uncomment and replace accordingly.
-# USER=root 
+# OPENIM_USER=root 
 
 # Default password for redis, mysql, mongo, as well as accessSecret in config/config.yaml.
 # Remember, it should be a combination of 8 or more numbers and letters. If you want to set a different password, uncomment and replace "openIM123".
@@ -168,7 +168,7 @@ function install_go() {
     command -v go >/dev/null 2>&1
     # Determines if GO_VERSION is defined
     if [ -z "$GO_VERSION" ]; then
-        GO_VERSION="1.18"
+        GO_VERSION="1.20"
     fi
 
     if [[ $? -ne 0 ]]; then
@@ -244,10 +244,10 @@ function download_source_code() {
 function set_openim_env() {
     warn "This command can only be executed once. It will modify the component passwords in docker-compose based on the PASSWORD variable in .env, and modify the component passwords in config/config.yaml. If the password in .env changes, you need to first execute docker-compose down; rm components -rf and then execute this command."
     # Set default values for user input
-    # If the USER environment variable is not set, it defaults to 'root'
-    if [ -z "$USER" ]; then
-        USER="root"
-        debug "USER is not set. Defaulting to 'root'."
+    # If the OPENIM_USER environment variable is not set, it defaults to 'root'
+    if [ -z "$OPENIM_USER" ]; then
+        OPENIM_USER="root"
+        debug "OPENIM_USER is not set. Defaulting to 'root'."
     fi
 
     # If the PASSWORD environment variable is not set, it defaults to 'openIM123'
@@ -309,7 +309,7 @@ function cmd_help() {
     color_echo ${BLUE_PREFIX} "-t,  --tag           ${CYAN_PREFIX}specify the tag (default option, set to latest if not specified)${COLOR_SUFFIX}"
     color_echo ${BLUE_PREFIX} "-r,  --release       ${CYAN_PREFIX}specify the release branch (cannot be used with the tag option)${COLOR_SUFFIX}"
     color_echo ${BLUE_PREFIX} "-gt, --github-token  ${CYAN_PREFIX}set the GITHUB_TOKEN (default: not set)${COLOR_SUFFIX}"
-    color_echo ${BLUE_PREFIX} "-g,  --go-version    ${CYAN_PREFIX}set the Go language version (default: GO_VERSION=\"1.18\")${COLOR_SUFFIX}"
+    color_echo ${BLUE_PREFIX} "-g,  --go-version    ${CYAN_PREFIX}set the Go language version (default: GO_VERSION=\"1.20\")${COLOR_SUFFIX}"
     color_echo ${BLUE_PREFIX} "--install-dir        ${CYAN_PREFIX}set the OpenIM installation directory (default: /tmp)${COLOR_SUFFIX}"
     color_echo ${BLUE_PREFIX} "--cpu                ${CYAN_PREFIX}set the number of concurrent processes${COLOR_SUFFIX}"
     echo
@@ -321,7 +321,7 @@ function cmd_help() {
 
 function parseinput() {
     # set default values
-    # USER=root
+    # OPENIM_USER=root
     # PASSWORD=openIM123
     # ENDPOINT=http://127.0.0.1:10005
     # API=http://127.0.0.1:10002/object/
@@ -329,7 +329,7 @@ function parseinput() {
     # CHINA=false
     # TAG=latest
     # RELEASE=""
-    # GO_VERSION=1.18
+    # GO_VERSION=1.20
     # INSTALL_DIR=/tmp
     # GITHUB_TOKEN=""
     # CPU=$(nproc)
@@ -347,7 +347,7 @@ function parseinput() {
                 ;;
             -u|--user)
                 shift
-                USER=$1
+                OPENIM_USER=$1
                 ;;
             -p|--password)
                 shift
@@ -458,25 +458,20 @@ function openim_color() {
 }
 
 # --- helper functions for logs ---
-info()
-{
+info() {
     echo -e "[${GREEN_PREFIX}INFO${COLOR_SUFFIX}] " "$@"
 }
-warn()
-{
+warn() {
     echo -e "[${YELLOW_PREFIX}WARN${COLOR_SUFFIX}] " "$@" >&2
 }
-fatal()
-{
+fatal() {
     echo -e "[${RED_PREFIX}ERROR${COLOR_SUFFIX}] " "$@" >&2
     exit 1
 }
-debug()
-{
+debug() {
     echo -e "[${BLUE_PREFIX}DEBUG${COLOR_SUFFIX}]===> " "$@"
 }
-success()
-{
+success() {
     echo -e "${BRIGHT_GREEN_PREFIX}=== [SUCCESS] ===${COLOR_SUFFIX}\n=> " "$@"
 }
 

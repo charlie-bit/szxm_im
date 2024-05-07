@@ -14,18 +14,41 @@
 
 package cmd
 
-import "github.com/spf13/cobra"
+import (
+	"context"
+	"github.com/openimsdk/open-im-server/v3/internal/api"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
+	"github.com/openimsdk/tools/system/program"
+	"github.com/spf13/cobra"
+)
 
 type ApiCmd struct {
 	*RootCmd
+	ctx       context.Context
+	configMap map[string]any
+	apiConfig *api.Config
 }
 
 func NewApiCmd() *ApiCmd {
-	return &ApiCmd{NewRootCmd("api")}
+	var apiConfig api.Config
+	ret := &ApiCmd{apiConfig: &apiConfig}
+	ret.configMap = map[string]any{
+		OpenIMAPICfgFileName:    &apiConfig.RpcConfig,
+		ZookeeperConfigFileName: &apiConfig.ZookeeperConfig,
+		ShareFileName:           &apiConfig.Share,
+	}
+	ret.RootCmd = NewRootCmd(program.GetProcessName(), WithConfigMap(ret.configMap))
+	ret.ctx = context.WithValue(context.Background(), "version", config.Version)
+	ret.Command.RunE = func(cmd *cobra.Command, args []string) error {
+		return ret.runE()
+	}
+	return ret
 }
 
-func (a *ApiCmd) AddApi(f func(port int) error) {
-	a.Command.RunE = func(cmd *cobra.Command, args []string) error {
-		return f(a.getPortFlag(cmd))
-	}
+func (a *ApiCmd) Exec() error {
+	return a.Execute()
+}
+
+func (a *ApiCmd) runE() error {
+	return api.Start(a.ctx, a.Index(), a.apiConfig)
 }

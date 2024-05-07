@@ -17,15 +17,15 @@ package cache
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/dtm-labs/rockscache"
-
-	"github.com/OpenIMSDK/tools/errs"
-	"github.com/OpenIMSDK/tools/log"
-	"github.com/OpenIMSDK/tools/utils"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/log"
+	"github.com/openimsdk/tools/mw/specialerror"
+	"github.com/openimsdk/tools/utils/datautil"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -34,15 +34,18 @@ const (
 	retryInterval = time.Millisecond * 100
 )
 
-var errIndex = errors.New("err index")
+var errIndex = errs.New("err index")
 
 type metaCache interface {
-	ExecDel(ctx context.Context) error
+	ExecDel(ctx context.Context, distinct ...bool) error
 	// delete key rapid
 	DelKey(ctx context.Context, key string) error
 	AddKeys(keys ...string)
 	ClearKeys()
 	GetPreDelKeys() []string
+	SetTopic(topic string)
+	SetRawRedisClient(cli redis.UniversalClient)
+	Copy() metaCache
 }
 
 func NewMetaCacheRedis(rcClient *rockscache.Client, keys ...string) metaCache {
@@ -50,33 +53,62 @@ func NewMetaCacheRedis(rcClient *rockscache.Client, keys ...string) metaCache {
 }
 
 type metaCacheRedis struct {
+	topic         string
 	rcClient      *rockscache.Client
 	keys          []string
 	maxRetryTimes int
 	retryInterval time.Duration
+	redisClient   redis.UniversalClient
 }
 
-func (m *metaCacheRedis) ExecDel(ctx context.Context) error {
+func (m *metaCacheRedis) Copy() metaCache {
+	var keys []string
 	if len(m.keys) > 0 {
-		log.ZDebug(ctx, "delete cache", "keys", m.keys)
-		retryTimes := 0
-		for {
-			if err := m.rcClient.TagAsDeletedBatch2(ctx, m.keys); err != nil {
-				if retryTimes >= m.maxRetryTimes {
-					err = errs.ErrInternalServer.Wrap(
-						fmt.Sprintf(
-							"delete cache error: %v, keys: %v, retry times %d, please check redis server",
-							err,
-							m.keys,
-							retryTimes,
-						),
-					)
-					log.ZWarn(ctx, "delete cache failed, please handle keys", err, "keys", m.keys)
-					return err
+		keys = make([]string, 0, len(m.keys)*2)
+		keys = append(keys, m.keys...)
+	}
+	return &metaCacheRedis{
+		topic:         m.topic,
+		rcClient:      m.rcClient,
+		keys:          keys,
+		maxRetryTimes: m.maxRetryTimes,
+		retryInterval: m.retryInterval,
+		redisClient:   m.redisClient,
+	}
+}
+
+func (m *metaCacheRedis) SetTopic(topic string) {
+	m.topic = topic
+}
+
+func (m *metaCacheRedis) SetRawRedisClient(cli redis.UniversalClient) {
+	m.redisClient = cli
+}
+
+func (m *metaCacheRedis) ExecDel(ctx context.Context, distinct ...bool) error {
+	if len(distinct) > 0 && distinct[0] {
+		m.keys = datautil.Distinct(m.keys)
+	}
+	if len(m.keys) > 0 {
+		log.ZDebug(ctx, "delete cache", "topic", m.topic, "keys", m.keys)
+		for _, key := range m.keys {
+			for i := 0; i < m.maxRetryTimes; i++ {
+				if err := m.rcClient.TagAsDeleted(key); err != nil {
+					log.ZError(ctx, "delete cache failed", err, "key", key)
+					time.Sleep(m.retryInterval)
+					continue
 				}
-				retryTimes++
-			} else {
 				break
+			}
+		}
+		if pk := getPublishKey(m.topic, m.keys); len(pk) > 0 {
+			data, err := json.Marshal(pk)
+			if err != nil {
+				log.ZError(ctx, "keys json marshal failed", err, "topic", m.topic, "keys", pk)
+			} else {
+				if err := m.redisClient.Publish(ctx, m.topic, string(data)).Err(); err != nil {
+					log.ZError(ctx, "redis publish cache delete error", err, "topic", m.topic, "keys", pk)
+				}
 			}
 		}
 	}
@@ -103,16 +135,11 @@ func GetDefaultOpt() rockscache.Options {
 	opts := rockscache.NewDefaultOptions()
 	opts.StrongConsistency = true
 	opts.RandomExpireAdjustment = 0.2
+
 	return opts
 }
 
-func getCache[T any](
-	ctx context.Context,
-	rcClient *rockscache.Client,
-	key string,
-	expire time.Duration,
-	fn func(ctx context.Context) (T, error),
-) (T, error) {
+func getCache[T any](ctx context.Context, rcClient *rockscache.Client, key string, expire time.Duration, fn func(ctx context.Context) (T, error)) (T, error) {
 	var t T
 	var write bool
 	v, err := rcClient.Fetch2(ctx, key, expire, func() (s string, err error) {
@@ -122,112 +149,136 @@ func getCache[T any](
 		}
 		bs, err := json.Marshal(t)
 		if err != nil {
-			return "", utils.Wrap(err, "")
+			return "", errs.WrapMsg(err, "marshal failed")
 		}
 		write = true
+
 		return string(bs), nil
 	})
 	if err != nil {
-		return t, err
+		return t, errs.Wrap(err)
 	}
 	if write {
 		return t, nil
 	}
 	if v == "" {
-		return t, errs.ErrRecordNotFound.Wrap("cache is not found")
+		return t, errs.ErrRecordNotFound.WrapMsg("cache is not found")
 	}
 	err = json.Unmarshal([]byte(v), &t)
 	if err != nil {
-		log.ZError(ctx, "cache json.Unmarshal failed", err, "key", key, "value", v, "expire", expire)
-		return t, utils.Wrap(err, "")
+		errInfo := fmt.Sprintf("cache json.Unmarshal failed, key:%s, value:%s, expire:%s", key, v, expire)
+		return t, errs.WrapMsg(err, errInfo)
 	}
+
 	return t, nil
 }
 
-func batchGetCache[T any](
+// func batchGetCache[T any](ctx context.Context, rcClient *rockscache.Client, keys []string, expire time.Duration, keyIndexFn func(t T, keys []string) (int, error), fn func(ctx context.Context) ([]T,
+// error)) ([]T, error) {
+//	batchMap, err := rcClient.FetchBatch2(ctx, keys, expire, func(idxs []int) (m map[int]string, err error) {
+//		values := make(map[int]string)
+//		tArrays, err := fn(ctx)
+//		if err != nil {
+//			return nil, err
+//		}
+//		for _, v := range tArrays {
+//			index, err := keyIndexFn(v, keys)
+//			if err != nil {
+//				continue
+//			}
+//			bs, err := json.Marshal(v)
+//			if err != nil {
+//				return nil, utils.Wrap(err, "marshal failed")
+//			}
+//			values[index] = string(bs)
+//		}
+//		return values, nil
+//	})
+//	if err != nil {
+//		return nil, err
+//	}
+//	var tArrays []T
+//	for _, v := range batchMap {
+//		if v != "" {
+//			var t T
+//			err = json.Unmarshal([]byte(v), &t)
+//			if err != nil {
+//				return nil, utils.Wrap(err, "unmarshal failed")
+//			}
+//			tArrays = append(tArrays, t)
+//		}
+//	}
+//	return tArrays, nil
+//}
+
+func batchGetCache2[T any, K comparable](
 	ctx context.Context,
 	rcClient *rockscache.Client,
-	keys []string,
 	expire time.Duration,
-	keyIndexFn func(t T, keys []string) (int, error),
-	fn func(ctx context.Context) ([]T, error),
+	keys []K,
+	keyFn func(key K) string,
+	fns func(ctx context.Context, key K) (T, error),
 ) ([]T, error) {
-	batchMap, err := rcClient.FetchBatch2(ctx, keys, expire, func(idxs []int) (m map[int]string, err error) {
-		values := make(map[int]string)
-		tArrays, err := fn(ctx)
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	res := make([]T, 0, len(keys))
+	for _, key := range keys {
+		val, err := getCache(ctx, rcClient, keyFn(key), expire, func(ctx context.Context) (T, error) {
+			return fns(ctx, key)
+		})
 		if err != nil {
-			return nil, err
-		}
-		for _, v := range tArrays {
-			index, err := keyIndexFn(v, keys)
-			if err != nil {
+			if errs.ErrRecordNotFound.Is(specialerror.ErrCode(errs.Unwrap(err))) {
 				continue
 			}
-			bs, err := json.Marshal(v)
-			if err != nil {
-				return nil, utils.Wrap(err, "marshal failed")
-			}
-			values[index] = string(bs)
+			return nil, errs.Wrap(err)
 		}
-		return values, nil
-	})
-	if err != nil {
-		return nil, err
+		res = append(res, val)
 	}
-	var tArrays []T
-	for _, v := range batchMap {
-		if v != "" {
-			var t T
-			err = json.Unmarshal([]byte(v), &t)
-			if err != nil {
-				return nil, utils.Wrap(err, "unmarshal failed")
-			}
-			tArrays = append(tArrays, t)
-		}
-	}
-	return tArrays, nil
+
+	return res, nil
 }
 
-func batchGetCacheMap[T any](
-	ctx context.Context,
-	rcClient *rockscache.Client,
-	keys, originKeys []string,
-	expire time.Duration,
-	keyIndexFn func(s string, keys []string) (int, error),
-	fn func(ctx context.Context) (map[string]T, error),
-) (map[string]T, error) {
-	batchMap, err := rcClient.FetchBatch2(ctx, keys, expire, func(idxs []int) (m map[int]string, err error) {
-		tArrays, err := fn(ctx)
-		if err != nil {
-			return nil, err
-		}
-		values := make(map[int]string)
-		for k, v := range tArrays {
-			index, err := keyIndexFn(k, originKeys)
-			if err != nil {
-				continue
-			}
-			bs, err := json.Marshal(v)
-			if err != nil {
-				return nil, utils.Wrap(err, "marshal failed")
-			}
-			values[index] = string(bs)
-		}
-		return values, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	tMap := make(map[string]T)
-	for i, v := range batchMap {
-		if v != "" {
-			var t T
-			err = json.Unmarshal([]byte(v), &t)
-			if err != nil {
-				return nil, utils.Wrap(err, "unmarshal failed")
-			}
-			tMap[originKeys[i]] = t
-		}
-	}
-	return tMap, nil
-}
+// func batchGetCacheMap[T any](
+//	ctx context.Context,
+//	rcClient *rockscache.Client,
+//	keys, originKeys []string,
+//	expire time.Duration,
+//	keyIndexFn func(s string, keys []string) (int, error),
+//	fn func(ctx context.Context) (map[string]T, error),
+// ) (map[string]T, error) {
+//	batchMap, err := rcClient.FetchBatch2(ctx, keys, expire, func(idxs []int) (m map[int]string, err error) {
+//		tArrays, err := fn(ctx)
+//		if err != nil {
+//			return nil, err
+//		}
+//		values := make(map[int]string)
+//		for k, v := range tArrays {
+//			index, err := keyIndexFn(k, originKeys)
+//			if err != nil {
+//				continue
+//			}
+//			bs, err := json.Marshal(v)
+//			if err != nil {
+//				return nil, utils.Wrap(err, "marshal failed")
+//			}
+//			values[index] = string(bs)
+//		}
+//		return values, nil
+//	})
+//	if err != nil {
+//		return nil, err
+//	}
+//	tMap := make(map[string]T)
+//	for i, v := range batchMap {
+//		if v != "" {
+//			var t T
+//			err = json.Unmarshal([]byte(v), &t)
+//			if err != nil {
+//				return nil, utils.Wrap(err, "unmarshal failed")
+//			}
+//			tMap[originKeys[i]] = t
+//		}
+//	}
+//	return tMap, nil
+//}

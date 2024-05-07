@@ -18,16 +18,15 @@ import (
 	"context"
 	"time"
 
-	"github.com/OpenIMSDK/tools/mcontext"
-
-	pbgroup "github.com/OpenIMSDK/protocol/group"
-	"github.com/OpenIMSDK/protocol/sdkws"
+	pbgroup "github.com/openimsdk/protocol/group"
+	"github.com/openimsdk/protocol/sdkws"
+	"github.com/openimsdk/tools/mcontext"
 )
 
 func UpdateGroupInfoMap(ctx context.Context, group *sdkws.GroupInfoForSet) map[string]any {
 	m := make(map[string]any)
 	if group.GroupName != "" {
-		m["name"] = group.GroupName
+		m["group_name"] = group.GroupName
 	}
 	if group.Notification != "" {
 		m["notification"] = group.Notification

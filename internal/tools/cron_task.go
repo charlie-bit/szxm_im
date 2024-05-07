@@ -17,38 +17,72 @@ package tools
 import (
 	"context"
 	"fmt"
-	"sync"
-
-	"github.com/robfig/cron/v3"
-
-	"github.com/OpenIMSDK/tools/log"
-
 	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
+	kdisc "github.com/openimsdk/open-im-server/v3/pkg/common/discoveryregister"
+	"github.com/openimsdk/protocol/msg"
+	"github.com/openimsdk/tools/mcontext"
+	"github.com/openimsdk/tools/mw"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/log"
+	"github.com/robfig/cron/v3"
 )
 
-func StartTask() error {
-	fmt.Println("cron task start, config", config.Config.ChatRecordsClearTime)
-	msgTool, err := InitMsgTool()
+type CronTaskConfig struct {
+	CronTask        config.CronTask
+	ZookeeperConfig config.ZooKeeper
+	Share           config.Share
+}
+
+func Start(ctx context.Context, config *CronTaskConfig) error {
+	log.CInfo(ctx, "CRON-TASK server is initializing", "chatRecordsClearTime", config.CronTask.ChatRecordsClearTime, "msgDestructTime", config.CronTask.RetainChatRecords)
+	if config.CronTask.RetainChatRecords < 1 {
+		return errs.New("msg destruct time must be greater than 1").Wrap()
+	}
+	client, err := kdisc.NewDiscoveryRegister(&config.ZookeeperConfig, &config.Share)
+	if err != nil {
+		return errs.WrapMsg(err, "failed to register discovery service")
+	}
+	client.AddOption(mw.GrpcClient(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	ctx, exitBy := context.WithCancelCause(context.Background())
+	ctx = mcontext.SetOpUserID(ctx, config.Share.IMAdminUserID[0])
+	conn, err := client.GetConn(ctx, config.Share.RpcRegisterName.Msg)
 	if err != nil {
 		return err
 	}
-	msgTool.ConvertTools()
-	c := cron.New()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	log.ZInfo(context.Background(), "start chatRecordsClearTime cron task", "cron config", config.Config.ChatRecordsClearTime)
-	_, err = c.AddFunc(config.Config.ChatRecordsClearTime, msgTool.AllConversationClearMsgAndFixSeq)
-	if err != nil {
-		fmt.Println("start allConversationClearMsgAndFixSeq cron failed", err.Error(), config.Config.ChatRecordsClearTime)
-		panic(err)
+	cli := msg.NewMsgClient(conn)
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGTERM)
+		select {
+		case <-ctx.Done():
+		case s := <-sigs:
+			exitBy(fmt.Errorf("exit signal %s", s))
+		}
+	}()
+	crontab := cron.New()
+	clearFunc := func() {
+		now := time.Now()
+		deltime := now.Add(-time.Hour * 24 * time.Duration(config.CronTask.RetainChatRecords))
+		ctx := mcontext.SetOperationID(ctx, fmt.Sprintf("cron_%d_%d", os.Getpid(), deltime.UnixMilli()))
+		log.ZInfo(ctx, "clear chat records", "deltime", deltime, "timestamp", deltime.UnixMilli())
+		if _, err := cli.ClearMsg(ctx, &msg.ClearMsgReq{Timestamp: deltime.UnixMilli()}); err != nil {
+			log.ZError(ctx, "cron clear chat records failed", err, "deltime", deltime, "cont", time.Since(now))
+			return
+		}
+		log.ZInfo(ctx, "cron clear chat records success", "deltime", deltime, "cont", time.Since(now))
 	}
-	log.ZInfo(context.Background(), "start msgDestruct cron task", "cron config", config.Config.MsgDestructTime)
-	_, err = c.AddFunc(config.Config.MsgDestructTime, msgTool.ConversationsDestructMsgs)
-	if err != nil {
-		fmt.Println("start conversationsDestructMsgs cron failed", err.Error(), config.Config.ChatRecordsClearTime)
-		panic(err)
+	if _, err := crontab.AddFunc(config.CronTask.ChatRecordsClearTime, clearFunc); err != nil {
+		return errs.Wrap(err)
 	}
-	c.Start()
-	wg.Wait()
-	return nil
+	log.ZInfo(ctx, "start cron task", "chatRecordsClearTime", config.CronTask.ChatRecordsClearTime)
+	crontab.Start()
+	<-ctx.Done()
+	return context.Cause(ctx)
 }

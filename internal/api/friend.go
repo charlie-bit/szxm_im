@@ -15,12 +15,10 @@
 package api
 
 import (
-	"github.com/OpenIMSDK/protocol/friend"
-	"github.com/OpenIMSDK/tools/a2r"
-
-	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
-
 	"github.com/gin-gonic/gin"
+	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
+	"github.com/openimsdk/protocol/friend"
+	"github.com/openimsdk/tools/a2r"
 )
 
 type FriendApi rpcclient.Friend
@@ -91,4 +89,7 @@ func (o *FriendApi) GetFriendIDs(c *gin.Context) {
 
 func (o *FriendApi) GetSpecifiedFriendsInfo(c *gin.Context) {
 	a2r.Call(friend.FriendClient.GetSpecifiedFriendsInfo, o.Client, c)
+}
+func (o *FriendApi) UpdateFriends(c *gin.Context) {
+	a2r.Call(friend.FriendClient.UpdateFriends, o.Client, c)
 }

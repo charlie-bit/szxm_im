@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/dtm-labs/rockscache"
-	"github.com/redis/go-redis/v9"
-
+	"github.com/openimsdk/open-im-server/v3/pkg/common/cachekey"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
 	relationtb "github.com/openimsdk/open-im-server/v3/pkg/common/db/table/relation"
+	"github.com/openimsdk/tools/log"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -46,16 +48,17 @@ type BlackCacheRedis struct {
 	blackDB    relationtb.BlackModelInterface
 }
 
-func NewBlackCacheRedis(
-	rdb redis.UniversalClient,
-	blackDB relationtb.BlackModelInterface,
-	options rockscache.Options,
-) BlackCache {
+func NewBlackCacheRedis(rdb redis.UniversalClient, localCache *config.LocalCache, blackDB relationtb.BlackModelInterface, options rockscache.Options) BlackCache {
 	rcClient := rockscache.NewClient(rdb, options)
+	mc := NewMetaCacheRedis(rcClient)
+	b := localCache.Friend
+	log.ZDebug(context.Background(), "black local cache init", "Topic", b.Topic, "SlotNum", b.SlotNum, "SlotSize", b.SlotSize, "enable", b.Enable())
+	mc.SetTopic(b.Topic)
+	mc.SetRawRedisClient(rdb)
 	return &BlackCacheRedis{
 		expireTime: blackExpireTime,
 		rcClient:   rcClient,
-		metaCache:  NewMetaCacheRedis(rcClient),
+		metaCache:  mc,
 		blackDB:    blackDB,
 	}
 }
@@ -65,12 +68,12 @@ func (b *BlackCacheRedis) NewCache() BlackCache {
 		expireTime: b.expireTime,
 		rcClient:   b.rcClient,
 		blackDB:    b.blackDB,
-		metaCache:  NewMetaCacheRedis(b.rcClient, b.metaCache.GetPreDelKeys()...),
+		metaCache:  b.Copy(),
 	}
 }
 
 func (b *BlackCacheRedis) getBlackIDsKey(ownerUserID string) string {
-	return blackIDsKey + ownerUserID
+	return cachekey.GetBlackIDsKey(ownerUserID)
 }
 
 func (b *BlackCacheRedis) GetBlackIDs(ctx context.Context, userID string) (blackIDs []string, err error) {
@@ -88,5 +91,6 @@ func (b *BlackCacheRedis) GetBlackIDs(ctx context.Context, userID string) (black
 func (b *BlackCacheRedis) DelBlackIDs(ctx context.Context, userID string) BlackCache {
 	cache := b.NewCache()
 	cache.AddKeys(b.getBlackIDsKey(userID))
+
 	return cache
 }

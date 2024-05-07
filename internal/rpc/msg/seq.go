@@ -17,16 +17,37 @@ package msg
 import (
 	"context"
 
-	pbmsg "github.com/OpenIMSDK/protocol/msg"
+	pbmsg "github.com/openimsdk/protocol/msg"
 )
 
-func (m *msgServer) GetConversationMaxSeq(
-	ctx context.Context,
-	req *pbmsg.GetConversationMaxSeqReq,
-) (resp *pbmsg.GetConversationMaxSeqResp, err error) {
+func (m *msgServer) GetConversationMaxSeq(ctx context.Context, req *pbmsg.GetConversationMaxSeqReq) (*pbmsg.GetConversationMaxSeqResp, error) {
 	maxSeq, err := m.MsgDatabase.GetMaxSeq(ctx, req.ConversationID)
 	if err != nil {
 		return nil, err
 	}
 	return &pbmsg.GetConversationMaxSeqResp{MaxSeq: maxSeq}, nil
+}
+
+func (m *msgServer) GetMaxSeqs(ctx context.Context, req *pbmsg.GetMaxSeqsReq) (*pbmsg.SeqsInfoResp, error) {
+	maxSeqs, err := m.MsgDatabase.GetMaxSeqs(ctx, req.ConversationIDs)
+	if err != nil {
+		return nil, err
+	}
+	return &pbmsg.SeqsInfoResp{MaxSeqs: maxSeqs}, nil
+}
+
+func (m *msgServer) GetHasReadSeqs(ctx context.Context, req *pbmsg.GetHasReadSeqsReq) (*pbmsg.SeqsInfoResp, error) {
+	hasReadSeqs, err := m.MsgDatabase.GetHasReadSeqs(ctx, req.UserID, req.ConversationIDs)
+	if err != nil {
+		return nil, err
+	}
+	return &pbmsg.SeqsInfoResp{MaxSeqs: hasReadSeqs}, nil
+}
+
+func (m *msgServer) GetMsgByConversationIDs(ctx context.Context, req *pbmsg.GetMsgByConversationIDsReq) (*pbmsg.GetMsgByConversationIDsResp, error) {
+	Msgs, err := m.MsgDatabase.FindOneByDocIDs(ctx, req.ConversationIDs, req.MaxSeqs)
+	if err != nil {
+		return nil, err
+	}
+	return &pbmsg.GetMsgByConversationIDsResp{MsgDatas: Msgs}, nil
 }

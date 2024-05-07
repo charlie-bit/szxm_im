@@ -29,26 +29,19 @@ tmp/
 bin/
 output/
 _output/
+deployments/charts/generated-configs/
 
 ### OpenIM Config ###
-config/config.yaml
-./config/config.yaml
 .env
-./.env
+config/config.yaml
+config/alertmanager.yml
+config/prometheus.yml
+config/email.tmpl
+config/notification.yaml
+config/instance-down-rules.yml
 
 ### OpenIM deploy ###
-deploy/openim_demo
-deploy/openim-api
-deploy/openim-rpc-msg_gateway
-deploy/openim-msgtransfer
-deploy/openim-push
-deploy/openim_timer_task
-deploy/openim-rpc-user
-deploy/openim-rpc-friend
-deploy/openim-rpc-group
-deploy/openim-rpc-msg
-deploy/openim-rpc-auth
-deploy/Open-IM-SDK-Core
+deployments/openim-server/charts
 
 # files used by the developer
 .idea.md
@@ -160,7 +153,6 @@ flycheck_*.el
 
 # Dependency directories (remove the comment below to include it)
 vendor/
-tools/imctl
 
 # Go workspace file
 # go.work
@@ -400,5 +392,3 @@ Sessionx.vim
 # End of https://www.toptal.com/developers/gitignore/api/go,git,vim,tags,test,emacs,backup,jetbrains
 .idea
 dist/
-.env
-config/config.yaml

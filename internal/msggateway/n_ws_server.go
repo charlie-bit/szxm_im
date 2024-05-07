@@ -16,42 +16,35 @@ package msggateway
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/webhook"
+	pbAuth "github.com/openimsdk/protocol/auth"
+	"github.com/openimsdk/tools/mcontext"
 	"net/http"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/OpenIMSDK/protocol/msggateway"
-
-	"github.com/openimsdk/open-im-server/v3/pkg/authverify"
-	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
-
-	"github.com/OpenIMSDK/protocol/constant"
-
-	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/cache"
-
-	"github.com/redis/go-redis/v9"
-
-	"github.com/OpenIMSDK/tools/discoveryregistry"
-
 	"github.com/go-playground/validator/v10"
-
-	"github.com/OpenIMSDK/tools/errs"
-	"github.com/OpenIMSDK/tools/log"
-	"github.com/OpenIMSDK/tools/utils"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/prommetrics"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/servererrs"
+	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
+	"github.com/openimsdk/protocol/constant"
+	"github.com/openimsdk/protocol/msggateway"
+	"github.com/openimsdk/tools/discovery"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/log"
+	"github.com/openimsdk/tools/utils/stringutil"
+	"golang.org/x/sync/errgroup"
 )
 
 type LongConnServer interface {
-	Run() error
+	Run(done chan error) error
 	wsHandler(w http.ResponseWriter, r *http.Request)
 	GetUserAllCons(userID string) ([]*Client, bool)
 	GetUserPlatformCons(userID string, platform int) ([]*Client, bool, bool)
-	Validate(s interface{}) error
-	SetCacheHandler(cache cache.MsgModel)
-	SetDiscoveryRegistry(client discoveryregistry.SvcDiscoveryRegistry)
+	Validate(s any) error
+	SetDiscoveryRegistry(client discovery.SvcDiscoveryRegistry, config *Config)
 	KickUserConn(client *Client) error
 	UnRegister(c *Client)
 	SetKickHandlerInfo(i *kickHandler)
@@ -60,13 +53,8 @@ type LongConnServer interface {
 	MessageHandler
 }
 
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 1024)
-	},
-}
-
 type WsServer struct {
+	msgGatewayConfig  *Config
 	port              int
 	wsMaxConnNum      int64
 	registerChan      chan *Client
@@ -74,27 +62,30 @@ type WsServer struct {
 	kickHandlerChan   chan *kickHandler
 	clients           *UserMap
 	clientPool        sync.Pool
-	onlineUserNum     int64
-	onlineUserConnNum int64
+	onlineUserNum     atomic.Int64
+	onlineUserConnNum atomic.Int64
 	handshakeTimeout  time.Duration
-	hubServer         *Server
+	writeBufferSize   int
 	validate          *validator.Validate
-	cache             cache.MsgModel
 	userClient        *rpcclient.UserRpcClient
-	disCov            discoveryregistry.SvcDiscoveryRegistry
+	authClient        *rpcclient.Auth
+	disCov            discovery.SvcDiscoveryRegistry
 	Compressor
 	Encoder
 	MessageHandler
+	webhookClient *webhook.Client
 }
+
 type kickHandler struct {
 	clientOK   bool
 	oldClients []*Client
 	newClient  *Client
 }
 
-func (ws *WsServer) SetDiscoveryRegistry(disCov discoveryregistry.SvcDiscoveryRegistry) {
-	ws.MessageHandler = NewGrpcHandler(ws.validate, disCov)
-	u := rpcclient.NewUserRpcClient(disCov)
+func (ws *WsServer) SetDiscoveryRegistry(disCov discovery.SvcDiscoveryRegistry, config *Config) {
+	ws.MessageHandler = NewGrpcHandler(ws.validate, disCov, &config.Share.RpcRegisterName)
+	u := rpcclient.NewUserRpcClient(disCov, config.Share.RpcRegisterName.User, config.Share.IMAdminUserID)
+	ws.authClient = rpcclient.NewAuth(disCov, config.Share.RpcRegisterName.Auth)
 	ws.userClient = &u
 	ws.disCov = disCov
 }
@@ -106,27 +97,17 @@ func (ws *WsServer) SetUserOnlineStatus(ctx context.Context, client *Client, sta
 	}
 	switch status {
 	case constant.Online:
-		err := CallbackUserOnline(ctx, client.UserID, client.PlatformID, client.IsBackground, client.ctx.GetConnID())
-		if err != nil {
-			log.ZWarn(ctx, "CallbackUserOnline err", err)
-		}
+		ws.webhookAfterUserOnline(ctx, &ws.msgGatewayConfig.WebhooksConfig.AfterUserOnline, client.UserID, client.PlatformID, client.IsBackground, client.ctx.GetConnID())
 	case constant.Offline:
-		err := CallbackUserOffline(ctx, client.UserID, client.PlatformID, client.ctx.GetConnID())
-		if err != nil {
-			log.ZWarn(ctx, "CallbackUserOffline err", err)
-		}
+		ws.webhookAfterUserOffline(ctx, &ws.msgGatewayConfig.WebhooksConfig.AfterUserOffline, client.UserID, client.PlatformID, client.ctx.GetConnID())
 	}
-}
-
-func (ws *WsServer) SetCacheHandler(cache cache.MsgModel) {
-	ws.cache = cache
 }
 
 func (ws *WsServer) UnRegister(c *Client) {
 	ws.unregisterChan <- c
 }
 
-func (ws *WsServer) Validate(s interface{}) error {
+func (ws *WsServer) Validate(_ any) error {
 	return nil
 }
 
@@ -138,21 +119,20 @@ func (ws *WsServer) GetUserPlatformCons(userID string, platform int) ([]*Client,
 	return ws.clients.Get(userID, platform)
 }
 
-func NewWsServer(opts ...Option) (*WsServer, error) {
+func NewWsServer(msgGatewayConfig *Config, opts ...Option) (*WsServer, error) {
 	var config configs
 	for _, o := range opts {
 		o(&config)
 	}
-	if config.port < 1024 {
-		return nil, errors.New("port not allow to listen")
-	}
 	v := validator.New()
 	return &WsServer{
+		msgGatewayConfig: msgGatewayConfig,
 		port:             config.port,
 		wsMaxConnNum:     config.maxConnNum,
+		writeBufferSize:  config.writeBufferSize,
 		handshakeTimeout: config.handshakeTimeout,
 		clientPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return new(Client)
 			},
 		},
@@ -163,14 +143,24 @@ func NewWsServer(opts ...Option) (*WsServer, error) {
 		clients:         newUserMap(),
 		Compressor:      NewGzipCompressor(),
 		Encoder:         NewGobEncoder(),
+		webhookClient:   webhook.NewWebhookClient(msgGatewayConfig.WebhooksConfig.URL),
 	}, nil
 }
 
-func (ws *WsServer) Run() error {
-	var client *Client
+func (ws *WsServer) Run(done chan error) error {
+	var (
+		client       *Client
+		netErr       error
+		shutdownDone = make(chan struct{}, 1)
+	)
+
+	server := http.Server{Addr: ":" + stringutil.IntToString(ws.port), Handler: nil}
+
 	go func() {
 		for {
 			select {
+			case <-shutdownDone:
+				return
 			case client = <-ws.registerChan:
 				ws.registerClient(client)
 			case client = <-ws.unregisterChan:
@@ -180,32 +170,67 @@ func (ws *WsServer) Run() error {
 			}
 		}
 	}()
-	http.HandleFunc("/", ws.wsHandler)
-	// http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {})
-	return http.ListenAndServe(":"+utils.IntToString(ws.port), nil) // Start listening
+	netDone := make(chan struct{}, 1)
+	go func() {
+		http.HandleFunc("/", ws.wsHandler)
+		err := server.ListenAndServe()
+		defer close(netDone)
+		if err != nil && err != http.ErrServerClosed {
+			netErr = errs.WrapMsg(err, "ws start err", server.Addr)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var err error
+	select {
+	case err = <-done:
+		sErr := server.Shutdown(ctx)
+		if sErr != nil {
+			return errs.WrapMsg(sErr, "shutdown err")
+		}
+		close(shutdownDone)
+		if err != nil {
+			return err
+		}
+	case <-netDone:
+	}
+	return netErr
+
 }
 
+var concurrentRequest = 3
+
 func (ws *WsServer) sendUserOnlineInfoToOtherNode(ctx context.Context, client *Client) error {
-	conns, err := ws.disCov.GetConns(ctx, config.Config.RpcRegisterName.OpenImMessageGatewayName)
+	conns, err := ws.disCov.GetConns(ctx, ws.msgGatewayConfig.Share.RpcRegisterName.MessageGateway)
 	if err != nil {
 		return err
 	}
+
+	wg := errgroup.Group{}
+	wg.SetLimit(concurrentRequest)
+
 	// Online push user online message to other node
 	for _, v := range conns {
+		v := v // safe closure var
 		if v.Target() == ws.disCov.GetSelfConnTarget() {
 			log.ZDebug(ctx, "Filter out this node", "node", v.Target())
 			continue
 		}
-		msgClient := msggateway.NewMsgGatewayClient(v)
-		_, err := msgClient.MultiTerminalLoginCheck(ctx, &msggateway.MultiTerminalLoginCheckReq{
-			UserID:     client.UserID,
-			PlatformID: int32(client.PlatformID), Token: client.token,
+
+		wg.Go(func() error {
+			msgClient := msggateway.NewMsgGatewayClient(v)
+			_, err := msgClient.MultiTerminalLoginCheck(ctx, &msggateway.MultiTerminalLoginCheckReq{
+				UserID:     client.UserID,
+				PlatformID: int32(client.PlatformID), Token: client.token,
+			})
+			if err != nil {
+				log.ZWarn(ctx, "MultiTerminalLoginCheck err", err, "node", v.Target())
+			}
+			return nil
 		})
-		if err != nil {
-			log.ZWarn(ctx, "MultiTerminalLoginCheck err", err, "node", v.Target())
-			continue
-		}
 	}
+
+	_ = wg.Wait()
 	return nil
 }
 
@@ -223,36 +248,48 @@ func (ws *WsServer) registerClient(client *Client) {
 	if !userOK {
 		ws.clients.Set(client.UserID, client)
 		log.ZDebug(client.ctx, "user not exist", "userID", client.UserID, "platformID", client.PlatformID)
-		atomic.AddInt64(&ws.onlineUserNum, 1)
-		atomic.AddInt64(&ws.onlineUserConnNum, 1)
+		prommetrics.OnlineUserGauge.Add(1)
+		ws.onlineUserNum.Add(1)
+		ws.onlineUserConnNum.Add(1)
 	} else {
-		i := &kickHandler{
-			clientOK:   clientOK,
-			oldClients: oldClients,
-			newClient:  client,
-		}
-		ws.kickHandlerChan <- i
+		ws.multiTerminalLoginChecker(clientOK, oldClients, client)
 		log.ZDebug(client.ctx, "user exist", "userID", client.UserID, "platformID", client.PlatformID)
 		if clientOK {
 			ws.clients.Set(client.UserID, client)
-			// 已经有同平台的连接存在
-			log.ZInfo(client.ctx, "repeat login", "userID", client.UserID, "platformID", client.PlatformID, "old remote addr", getRemoteAdders(oldClients))
-			atomic.AddInt64(&ws.onlineUserConnNum, 1)
+			// There is already a connection to the platform
+			log.ZInfo(client.ctx, "repeat login", "userID", client.UserID, "platformID",
+				client.PlatformID, "old remote addr", getRemoteAdders(oldClients))
+			ws.onlineUserConnNum.Add(1)
 		} else {
 			ws.clients.Set(client.UserID, client)
-
-			atomic.AddInt64(&ws.onlineUserConnNum, 1)
+			ws.onlineUserConnNum.Add(1)
 		}
 	}
-	ws.sendUserOnlineInfoToOtherNode(client.ctx, client)
-	ws.SetUserOnlineStatus(client.ctx, client, constant.Online)
+
+	wg := sync.WaitGroup{}
+	if ws.msgGatewayConfig.Share.Env == "zookeeper" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = ws.sendUserOnlineInfoToOtherNode(client.ctx, client)
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ws.SetUserOnlineStatus(client.ctx, client, constant.Online)
+	}()
+
+	wg.Wait()
+
 	log.ZInfo(
 		client.ctx,
 		"user online",
 		"online user Num",
-		ws.onlineUserNum,
+		ws.onlineUserNum.Load(),
 		"online user conn Num",
-		ws.onlineUserConnNum,
+		ws.onlineUserConnNum.Load(),
 	)
 }
 
@@ -274,7 +311,7 @@ func (ws *WsServer) KickUserConn(client *Client) error {
 }
 
 func (ws *WsServer) multiTerminalLoginChecker(clientOK bool, oldClients []*Client, newClient *Client) {
-	switch config.Config.MultiLoginPolicy {
+	switch ws.msgGatewayConfig.MsgGateway.MultiLoginPolicy {
 	case constant.DefalutNotKick:
 	case constant.PCAndOther:
 		if constant.PlatformIDToClass(newClient.PlatformID) == constant.TerminalPC {
@@ -282,69 +319,23 @@ func (ws *WsServer) multiTerminalLoginChecker(clientOK bool, oldClients []*Clien
 		}
 		fallthrough
 	case constant.AllLoginButSameTermKick:
-		if clientOK {
-			isDeleteUser := ws.clients.deleteClients(newClient.UserID, oldClients)
-			if isDeleteUser {
-				atomic.AddInt64(&ws.onlineUserNum, -1)
-			}
-			for _, c := range oldClients {
-				err := c.KickOnlineMessage()
-				if err != nil {
-					log.ZWarn(c.ctx, "KickOnlineMessage", err)
-				}
-			}
-			m, err := ws.cache.GetTokensWithoutError(
-				newClient.ctx,
-				newClient.UserID,
-				newClient.PlatformID,
-			)
-			if err != nil && err != redis.Nil {
-				log.ZWarn(
-					newClient.ctx,
-					"get token from redis err",
-					err,
-					"userID",
-					newClient.UserID,
-					"platformID",
-					newClient.PlatformID,
-				)
-				return
-			}
-			if m == nil {
-				log.ZWarn(
-					newClient.ctx,
-					"m is nil",
-					errors.New("m is nil"),
-					"userID",
-					newClient.UserID,
-					"platformID",
-					newClient.PlatformID,
-				)
-				return
-			}
-			log.ZDebug(
-				newClient.ctx,
-				"get token from redis",
-				"userID",
-				newClient.UserID,
-				"platformID",
-				newClient.PlatformID,
-				"tokenMap",
-				m,
-			)
-
-			for k := range m {
-				if k != newClient.ctx.GetToken() {
-					m[k] = constant.KickedToken
-				}
-			}
-			log.ZDebug(newClient.ctx, "set token map is ", "token map", m, "userID",
-				newClient.UserID, "token", newClient.ctx.GetToken())
-			err = ws.cache.SetTokenMapByUidPid(newClient.ctx, newClient.UserID, newClient.PlatformID, m)
+		if !clientOK {
+			return
+		}
+		ws.clients.deleteClients(newClient.UserID, oldClients)
+		for _, c := range oldClients {
+			err := c.KickOnlineMessage()
 			if err != nil {
-				log.ZWarn(newClient.ctx, "SetTokenMapByUidPid err", err, "userID", newClient.UserID, "platformID", newClient.PlatformID)
-				return
+				log.ZWarn(c.ctx, "KickOnlineMessage", err)
 			}
+		}
+		ctx := mcontext.WithMustInfoCtx(
+			[]string{newClient.ctx.GetOperationID(), newClient.ctx.GetUserID(),
+				constant.PlatformIDToName(newClient.PlatformID), newClient.ctx.GetConnID()},
+		)
+		if _, err := ws.authClient.InvalidateToken(ctx, newClient.token, newClient.UserID, newClient.PlatformID); err != nil {
+			log.ZWarn(newClient.ctx, "InvalidateToken err", err, "userID", newClient.UserID,
+				"platformID", newClient.PlatformID)
 		}
 	}
 }
@@ -353,92 +344,99 @@ func (ws *WsServer) unregisterClient(client *Client) {
 	defer ws.clientPool.Put(client)
 	isDeleteUser := ws.clients.delete(client.UserID, client.ctx.GetRemoteAddr())
 	if isDeleteUser {
-		atomic.AddInt64(&ws.onlineUserNum, -1)
+		ws.onlineUserNum.Add(-1)
+		prommetrics.OnlineUserGauge.Dec()
 	}
-	atomic.AddInt64(&ws.onlineUserConnNum, -1)
+	ws.onlineUserConnNum.Add(-1)
 	ws.SetUserOnlineStatus(client.ctx, client, constant.Offline)
-	log.ZInfo(client.ctx, "user offline", "close reason", client.closedErr, "online user Num", ws.onlineUserNum, "online user conn Num",
-		ws.onlineUserConnNum,
+	log.ZInfo(client.ctx, "user offline", "close reason", client.closedErr, "online user Num",
+		ws.onlineUserNum.Load(), "online user conn Num",
+		ws.onlineUserConnNum.Load(),
 	)
 }
 
-func (ws *WsServer) wsHandler(w http.ResponseWriter, r *http.Request) {
-	connContext := newContext(w, r)
-	if ws.onlineUserConnNum >= ws.wsMaxConnNum {
-		httpError(connContext, errs.ErrConnOverMaxNumLimit)
-		return
+// validateRespWithRequest checks if the response matches the expected userID and platformID.
+func (ws *WsServer) validateRespWithRequest(ctx *UserConnContext, resp *pbAuth.ParseTokenResp) error {
+	userID := ctx.GetUserID()
+	platformID := stringutil.StringToInt32(ctx.GetPlatformID())
+	if resp.UserID != userID {
+		return servererrs.ErrTokenInvalid.WrapMsg(fmt.Sprintf("token uid %s != userID %s", resp.UserID, userID))
 	}
-	var (
-		token         string
-		userID        string
-		platformIDStr string
-		exists        bool
-		compression   bool
-	)
+	if resp.PlatformID != platformID {
+		return servererrs.ErrTokenInvalid.WrapMsg(fmt.Sprintf("token platform %d != platformID %d", resp.PlatformID, platformID))
+	}
+	return nil
+}
 
-	token, exists = connContext.Query(Token)
-	if !exists {
-		httpError(connContext, errs.ErrConnArgsErr)
+func (ws *WsServer) wsHandler(w http.ResponseWriter, r *http.Request) {
+	// Create a new connection context
+	connContext := newContext(w, r)
+
+	// Check if the current number of online user connections exceeds the maximum limit
+	if ws.onlineUserConnNum.Load() >= ws.wsMaxConnNum {
+		// If it exceeds the maximum connection number, return an error via HTTP and stop processing
+		httpError(connContext, servererrs.ErrConnOverMaxNumLimit.WrapMsg("over max conn num limit"))
 		return
 	}
-	userID, exists = connContext.Query(WsUserID)
-	if !exists {
-		httpError(connContext, errs.ErrConnArgsErr)
-		return
-	}
-	platformIDStr, exists = connContext.Query(PlatformID)
-	if !exists {
-		httpError(connContext, errs.ErrConnArgsErr)
-		return
-	}
-	platformID, err := strconv.Atoi(platformIDStr)
+
+	// Parse essential arguments (e.g., user ID, Token)
+	err := connContext.ParseEssentialArgs()
 	if err != nil {
-		httpError(connContext, errs.ErrConnArgsErr)
-		return
-	}
-	if err := authverify.WsVerifyToken(token, userID, platformID); err != nil {
+		// If there's an error during parsing, return an error via HTTP and stop processing
+
 		httpError(connContext, err)
 		return
 	}
-	m, err := ws.cache.GetTokensWithoutError(context.Background(), userID, platformID)
+
+	// Call the authentication client to parse the Token obtained from the context
+	resp, err := ws.authClient.ParseToken(connContext, connContext.GetToken())
 	if err != nil {
-		httpError(connContext, err)
-		return
-	}
-	if v, ok := m[token]; ok {
-		switch v {
-		case constant.NormalToken:
-		case constant.KickedToken:
-			httpError(connContext, errs.ErrTokenKicked.Wrap())
-			return
-		default:
-			httpError(connContext, errs.ErrTokenUnknown.Wrap())
-			return
+		// If there's an error parsing the Token, decide whether to send the error message via WebSocket based on the context flag
+		shouldSendError := connContext.ShouldSendResp()
+		if shouldSendError {
+			// Create a WebSocket connection object and attempt to send the error message via WebSocket
+			wsLongConn := newGWebSocket(WebSocket, ws.handshakeTimeout, ws.writeBufferSize)
+			if err := wsLongConn.RespondWithError(err, w, r); err == nil {
+				// If the error message is successfully sent via WebSocket, stop processing
+				return
+			}
 		}
+		// If sending via WebSocket is not required or fails, return the error via HTTP and stop processing
+		httpError(connContext, err)
+		return
+	}
+
+	// Validate the authentication response matches the request (e.g., user ID and platform ID)
+	err = ws.validateRespWithRequest(connContext, resp)
+	if err != nil {
+		// If validation fails, return an error via HTTP and stop processing
+		httpError(connContext, err)
+		return
+	}
+
+	// Create a WebSocket long connection object
+	wsLongConn := newGWebSocket(WebSocket, ws.handshakeTimeout, ws.writeBufferSize)
+	if err := wsLongConn.GenerateLongConn(w, r); err != nil {
+		//If the creation of the long connection fails, the error is handled internally during the handshake process.
+		log.ZWarn(connContext, "long connection fails", err)
+		return
 	} else {
-		httpError(connContext, errs.ErrTokenNotExist.Wrap())
-		return
-	}
-	wsLongConn := newGWebSocket(WebSocket, ws.handshakeTimeout)
-	err = wsLongConn.GenerateLongConn(w, r)
-	if err != nil {
-		httpError(connContext, err)
-		return
-	}
-	compressProtoc, exists := connContext.Query(Compression)
-	if exists {
-		if compressProtoc == GzipCompressionProtocol {
-			compression = true
+		// Check if a normal response should be sent via WebSocket
+		shouldSendSuccessResp := connContext.ShouldSendResp()
+		if shouldSendSuccessResp {
+			// Attempt to send a success message through WebSocket
+			if err := wsLongConn.RespondWithSuccess(); err != nil {
+				// If the success message is successfully sent, end further processing
+				return
+			}
 		}
 	}
-	compressProtoc, exists = connContext.GetHeader(Compression)
-	if exists {
-		if compressProtoc == GzipCompressionProtocol {
-			compression = true
-		}
-	}
+
+	// Retrieve a client object from the client pool, reset its state, and associate it with the current WebSocket long connection
 	client := ws.clientPool.Get().(*Client)
-	client.ResetClient(connContext, wsLongConn, connContext.GetBackground(), compression, ws, token)
+	client.ResetClient(connContext, wsLongConn, ws)
+
+	// Register the client with the server and start message processing
 	ws.registerChan <- client
 	go client.readMessage()
 }

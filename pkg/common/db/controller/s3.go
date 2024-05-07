@@ -19,9 +19,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/s3"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/s3/cont"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/db/cache"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/db/table/relation"
+	"github.com/openimsdk/tools/s3"
+	"github.com/openimsdk/tools/s3/cont"
+	"github.com/redis/go-redis/v9"
 )
 
 type S3Database interface {
@@ -32,18 +34,22 @@ type S3Database interface {
 	CompleteMultipartUpload(ctx context.Context, uploadID string, parts []string) (*cont.UploadResult, error)
 	AccessURL(ctx context.Context, name string, expire time.Duration, opt *s3.AccessURLOption) (time.Time, string, error)
 	SetObject(ctx context.Context, info *relation.ObjectModel) error
+	StatObject(ctx context.Context, name string) (*s3.ObjectInfo, error)
+	FormData(ctx context.Context, name string, size int64, contentType string, duration time.Duration) (*s3.FormData, error)
 }
 
-func NewS3Database(s3 s3.Interface, obj relation.ObjectInfoModelInterface) S3Database {
+func NewS3Database(rdb redis.UniversalClient, s3 s3.Interface, obj relation.ObjectInfoModelInterface) S3Database {
 	return &s3Database{
-		s3:  cont.New(s3),
-		obj: obj,
+		s3:    cont.New(cache.NewS3Cache(rdb, s3), s3),
+		cache: cache.NewObjectCacheRedis(rdb, obj),
+		db:    obj,
 	}
 }
 
 type s3Database struct {
-	s3  *cont.Controller
-	obj relation.ObjectInfoModelInterface
+	s3    *cont.Controller
+	cache cache.ObjectCache
+	db    relation.ObjectInfoModelInterface
 }
 
 func (s *s3Database) PartSize(ctx context.Context, size int64) (int64, error) {
@@ -67,11 +73,15 @@ func (s *s3Database) CompleteMultipartUpload(ctx context.Context, uploadID strin
 }
 
 func (s *s3Database) SetObject(ctx context.Context, info *relation.ObjectModel) error {
-	return s.obj.SetObject(ctx, info)
+	info.Engine = s.s3.Engine()
+	if err := s.db.SetObject(ctx, info); err != nil {
+		return err
+	}
+	return s.cache.DelObjectName(info.Engine, info.Name).ExecDel(ctx)
 }
 
 func (s *s3Database) AccessURL(ctx context.Context, name string, expire time.Duration, opt *s3.AccessURLOption) (time.Time, string, error) {
-	obj, err := s.obj.Take(ctx, name)
+	obj, err := s.cache.GetName(ctx, s.s3.Engine(), name)
 	if err != nil {
 		return time.Time{}, "", err
 	}
@@ -90,4 +100,12 @@ func (s *s3Database) AccessURL(ctx context.Context, name string, expire time.Dur
 		return time.Time{}, "", err
 	}
 	return expireTime, rawURL, nil
+}
+
+func (s *s3Database) StatObject(ctx context.Context, name string) (*s3.ObjectInfo, error) {
+	return s.s3.StatObject(ctx, name)
+}
+
+func (s *s3Database) FormData(ctx context.Context, name string, size int64, contentType string, duration time.Duration) (*s3.FormData, error) {
+	return s.s3.FormData(ctx, name, size, contentType, duration)
 }

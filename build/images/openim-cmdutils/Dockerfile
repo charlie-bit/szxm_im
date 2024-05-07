@@ -19,7 +19,6 @@
 FROM golang:1.20 AS builder
 
 ARG GO111MODULE=on
-ARG GOPROXY=https://goproxy.cn,direct
 
 WORKDIR /openim/openim-server
 
@@ -31,19 +30,15 @@ RUN go mod download
 
 COPY . .
 
-RUN go mod download
-RUN make clean
 RUN make build BINS=openim-cmdutils
+RUN cp /openim/openim-server/_output/bin/platforms/$(go env GOOS)/$(go env GOARCH)/openim-cmdutils /usr/bin/openim-cmdutils
 
 FROM ghcr.io/openim-sigs/openim-bash-image:latest
 
 WORKDIR /openim/openim-server
 
-COPY --from=builder $OPENIM_SERVER_BINDIR/platforms /openim/openim-server/_output/bin/platforms
-COPY --from=builder ${SERVER_WORKDIR}/config /openim/openim-server/config
+COPY --from=builder /usr/bin/openim-cmdutils ./bin/openim-cmdutils
 
-RUN mv ${OPENIM_SERVER_BINDIR}/platforms/$(get_os)/$(get_arch)/openim-cmdutils /usr/bin/openim-cmdutils
-
-ENTRYPOINT ["openim-cmdutils"]
+ENTRYPOINT ["./bin/openim-cmdutils"]
 
 CMD ["--help"]

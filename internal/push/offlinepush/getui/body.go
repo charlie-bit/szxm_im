@@ -21,9 +21,9 @@ import (
 )
 
 type Resp struct {
-	Code int         `json:"code"`
-	Msg  string      `json:"msg"`
-	Data interface{} `json:"data"`
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data any    `json:"data"`
 }
 
 func (r *Resp) parseError() (err error) {
@@ -133,13 +133,13 @@ type Payload struct {
 	IsSignal bool `json:"isSignal"`
 }
 
-func newPushReq(title, content string) PushReq {
+func newPushReq(pushConf *config.Push, title, content string) PushReq {
 	pushReq := PushReq{PushMessage: &PushMessage{Notification: &Notification{
 		Title:       title,
 		Body:        content,
 		ClickType:   "startapp",
-		ChannelID:   config.Config.Push.GeTui.ChannelID,
-		ChannelName: config.Config.Push.GeTui.ChannelName,
+		ChannelID:   pushConf.GeTui.ChannelID,
+		ChannelName: pushConf.GeTui.ChannelName,
 	}}}
 	return pushReq
 }

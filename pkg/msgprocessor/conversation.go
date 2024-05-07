@@ -18,8 +18,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/OpenIMSDK/protocol/constant"
-	"github.com/OpenIMSDK/protocol/sdkws"
+	"github.com/openimsdk/protocol/constant"
+	"github.com/openimsdk/protocol/sdkws"
+	"github.com/openimsdk/tools/errs"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -29,9 +30,9 @@ func GetNotificationConversationIDByMsg(msg *sdkws.MsgData) string {
 		l := []string{msg.SendID, msg.RecvID}
 		sort.Strings(l)
 		return "n_" + strings.Join(l, "_")
-	case constant.GroupChatType:
+	case constant.WriteGroupChatType:
 		return "n_" + msg.GroupID
-	case constant.SuperGroupChatType:
+	case constant.ReadGroupChatType:
 		return "n_" + msg.GroupID
 	case constant.NotificationChatType:
 		return "n_" + msg.SendID + "_" + msg.RecvID
@@ -45,13 +46,14 @@ func GetChatConversationIDByMsg(msg *sdkws.MsgData) string {
 		l := []string{msg.SendID, msg.RecvID}
 		sort.Strings(l)
 		return "si_" + strings.Join(l, "_")
-	case constant.GroupChatType:
+	case constant.WriteGroupChatType:
 		return "g_" + msg.GroupID
-	case constant.SuperGroupChatType:
+	case constant.ReadGroupChatType:
 		return "sg_" + msg.GroupID
 	case constant.NotificationChatType:
 		return "sn_" + msg.SendID + "_" + msg.RecvID
 	}
+
 	return ""
 }
 
@@ -61,7 +63,7 @@ func GenConversationUniqueKey(msg *sdkws.MsgData) string {
 		l := []string{msg.SendID, msg.RecvID}
 		sort.Strings(l)
 		return strings.Join(l, "_")
-	case constant.SuperGroupChatType:
+	case constant.ReadGroupChatType:
 		return msg.GroupID
 	}
 	return ""
@@ -77,12 +79,12 @@ func GetConversationIDByMsg(msg *sdkws.MsgData) string {
 			return "n_" + strings.Join(l, "_")
 		}
 		return "si_" + strings.Join(l, "_") // single chat
-	case constant.GroupChatType:
+	case constant.WriteGroupChatType:
 		if !options.IsNotNotification() {
 			return "n_" + msg.GroupID // group chat
 		}
 		return "g_" + msg.GroupID // group chat
-	case constant.SuperGroupChatType:
+	case constant.ReadGroupChatType:
 		if !options.IsNotNotification() {
 			return "n_" + msg.GroupID // super group chat
 		}
@@ -104,9 +106,9 @@ func GetConversationIDBySessionType(sessionType int, ids ...string) string {
 	switch sessionType {
 	case constant.SingleChatType:
 		return "si_" + strings.Join(ids, "_") // single chat
-	case constant.GroupChatType:
+	case constant.WriteGroupChatType:
 		return "g_" + ids[0] // group chat
-	case constant.SuperGroupChatType:
+	case constant.ReadGroupChatType:
 		return "sg_" + ids[0] // super group chat
 	case constant.NotificationChatType:
 		return "sn_" + ids[0] // server notification chat
@@ -119,9 +121,9 @@ func GetNotificationConversationIDByConversationID(conversationID string) string
 	if len(l) > 1 {
 		l[0] = "n"
 		return strings.Join(l, "_")
-	} else {
-		return ""
 	}
+
+	return ""
 }
 
 func GetNotificationConversationID(sessionType int, ids ...string) string {
@@ -132,7 +134,7 @@ func GetNotificationConversationID(sessionType int, ids ...string) string {
 	switch sessionType {
 	case constant.SingleChatType:
 		return "n_" + strings.Join(ids, "_") // single chat
-	case constant.SuperGroupChatType:
+	case constant.ReadGroupChatType:
 		return "n_" + ids[0] // super group chat
 	}
 	return ""
@@ -156,7 +158,7 @@ func ParseConversationID(msg *sdkws.MsgData) (isNotification bool, conversationI
 			return true, "n_" + strings.Join(l, "_")
 		}
 		return false, "si_" + strings.Join(l, "_") // single chat
-	case constant.SuperGroupChatType:
+	case constant.ReadGroupChatType:
 		if !options.IsNotNotification() {
 			return true, "n_" + msg.GroupID // super group chat
 		}
@@ -187,7 +189,7 @@ func (s MsgBySeq) Swap(i, j int) {
 func Pb2String(pb proto.Message) (string, error) {
 	s, err := proto.Marshal(pb)
 	if err != nil {
-		return "", err
+		return "", errs.Wrap(err)
 	}
 	return string(s), nil
 }

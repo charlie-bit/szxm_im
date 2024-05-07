@@ -3,12 +3,36 @@
 
 before:
   hooks:
+    - make clean
     # You may remove this if you don't use go modules.
     - make tidy
     - make copyright.add
     # you may remove this if you don't need go generate
     - go generate ./...
 
+git:
+  # What should be used to sort tags when gathering the current and previous
+  # tags if there are more than one tag in the same commit.
+  #
+  # Default: '-version:refname'
+  tag_sort: -version:creatordate
+
+  # What should be used to specify prerelease suffix while sorting tags when gathering
+  # the current and previous tags if there are more than one tag in the same commit.
+  #
+  # Since: v1.17
+  prerelease_suffix: "-"
+
+  # Tags to be ignored by GoReleaser.
+  # This means that GoReleaser will not pick up tags that match any of the
+  # provided values as either previous or current tags.
+  #
+  # Templates: allowed.
+  # Since: v1.21.
+  ignore_tags:
+    - nightly
+    # - "{{.Env.IGNORE_TAG}}"
+  
 snapshot:
   name_template: "{{ incpatch .Version }}-next"
 
@@ -255,131 +279,6 @@ builds:
       - "6"
       - "7"
 
-  - binary: infra
-    id: infra
-    main: ./tools/infra/infra.go
-    goos:
-      - darwin
-      - windows
-      - linux
-    goarch:
-      - s390x
-      - mips64
-      - mips64le
-      - amd64
-      - ppc64le
-      - arm64
-    goarm:
-      - "6"
-      - "7"
-
-  - binary: ncpu
-    id: ncpu
-    main: ./tools/ncpu/ncpu.go
-    goos:
-      - darwin
-      - windows
-      - linux
-    goarch:
-      - s390x
-      - mips64
-      - mips64le
-      - amd64
-      - ppc64le
-      - arm64
-    goarm:
-      - "6"
-      - "7"
-
-  - binary: openim-web
-    id: openim-web
-    main: ./tools/openim-web/openim-web.go
-    goos:
-      - darwin
-      - windows
-      - linux
-    goarch:
-      - s390x
-      - mips64
-      - mips64le
-      - amd64
-      - ppc64le
-      - arm64
-    goarm:
-      - "6"
-      - "7"
-
-  - binary: component
-    id: component
-    main: ./tools/component/component.go
-    goos:
-      - darwin
-      - windows
-      - linux
-    goarch:
-      - s390x
-      - mips64
-      - mips64le
-      - amd64
-      - ppc64le
-      - arm64
-    goarm:
-      - "6"
-      - "7"
-    
-  - binary: versionchecker
-    id: versionchecker
-    main: ./tools/versionchecker/versionchecker.go
-    goos:
-      - darwin
-      - windows
-      - linux
-    goarch:
-      - s390x
-      - mips64
-      - mips64le
-      - amd64
-      - ppc64le
-      - arm64
-    goarm:
-      - "6"
-      - "7"
-
-  - binary: changelog
-    id: changelog
-    main: ./tools/changelog/changelog.go
-    goos:
-      - darwin
-      - windows
-      - linux
-    goarch:
-      - s390x
-      - mips64
-      - mips64le
-      - amd64
-      - ppc64le
-      - arm64
-    goarm:
-      - "6"
-      - "7"
-
-  - binary: yamlfmt
-    id: yamlfmt
-    main: ./tools/yamlfmt/yamlfmt.go
-    goos:
-      - darwin
-      - windows
-      - linux
-    goarch:
-      - s390x
-      - mips64
-      - mips64le
-      - amd64
-      - ppc64le
-      - arm64
-    goarm:
-      - "6"
-      - "7"
 
 # TODO：Need a script, such as the init - release to help binary to find the right directory
 # ,which can be compiled binary

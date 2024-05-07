@@ -18,41 +18,53 @@ import (
 	"context"
 	"time"
 
-	"github.com/openimsdk/open-im-server/v3/pkg/msgprocessor"
-
-	"github.com/OpenIMSDK/protocol/constant"
-	"github.com/OpenIMSDK/tools/log"
-	"github.com/OpenIMSDK/tools/tx"
-	"github.com/OpenIMSDK/tools/utils"
-
 	"github.com/openimsdk/open-im-server/v3/pkg/common/db/cache"
 	relationtb "github.com/openimsdk/open-im-server/v3/pkg/common/db/table/relation"
+	"github.com/openimsdk/open-im-server/v3/pkg/msgprocessor"
+	"github.com/openimsdk/protocol/constant"
+	"github.com/openimsdk/tools/db/pagination"
+	"github.com/openimsdk/tools/db/tx"
+	"github.com/openimsdk/tools/log"
+	"github.com/openimsdk/tools/utils/datautil"
+	"github.com/openimsdk/tools/utils/stringutil"
 )
 
 type ConversationDatabase interface {
-	// UpdateUserConversationFiled 更新用户该会话的属性信息
-	UpdateUsersConversationFiled(ctx context.Context, userIDs []string, conversationID string, args map[string]interface{}) error
-	// CreateConversation 创建一批新的会话
+	// UpdateUsersConversationField updates the properties of a conversation for specified users.
+	UpdateUsersConversationField(ctx context.Context, userIDs []string, conversationID string, args map[string]any) error
+	// CreateConversation creates a batch of new conversations.
 	CreateConversation(ctx context.Context, conversations []*relationtb.ConversationModel) error
-	// SyncPeerUserPrivateConversation 同步对端私聊会话内部保证事务操作
+	// SyncPeerUserPrivateConversationTx ensures transactional operation while syncing private conversations between peers.
 	SyncPeerUserPrivateConversationTx(ctx context.Context, conversation []*relationtb.ConversationModel) error
-	// FindConversations 根据会话ID获取某个用户的多个会话
+	// FindConversations retrieves multiple conversations of a user by conversation IDs.
 	FindConversations(ctx context.Context, ownerUserID string, conversationIDs []string) ([]*relationtb.ConversationModel, error)
-	// FindRecvMsgNotNotifyUserIDs 获取超级大群开启免打扰的用户ID
-	FindRecvMsgNotNotifyUserIDs(ctx context.Context, groupID string) ([]string, error)
-	// GetUserAllConversation 获取一个用户在服务器上所有的会话
+	// GetUserAllConversation fetches all conversations of a user on the server.
 	GetUserAllConversation(ctx context.Context, ownerUserID string) ([]*relationtb.ConversationModel, error)
-	// SetUserConversations 设置用户多个会话属性，如果会话不存在则创建，否则更新,内部保证原子性
+	// SetUserConversations sets multiple conversation properties for a user, creates new conversations if they do not exist, or updates them otherwise. This operation is atomic.
 	SetUserConversations(ctx context.Context, ownerUserID string, conversations []*relationtb.ConversationModel) error
-	// SetUsersConversationFiledTx 设置多个用户会话关于某个字段的更新操作，如果会话不存在则创建，否则更新，内部保证事务操作
-	SetUsersConversationFiledTx(ctx context.Context, userIDs []string, conversation *relationtb.ConversationModel, filedMap map[string]interface{}) error
+	// SetUsersConversationFieldTx updates a specific field for multiple users' conversations, creating new conversations if they do not exist, or updates them otherwise. This operation is
+	// transactional.
+	SetUsersConversationFieldTx(ctx context.Context, userIDs []string, conversation *relationtb.ConversationModel, fieldMap map[string]any) error
+	// CreateGroupChatConversation creates a group chat conversation for the specified group ID and user IDs.
 	CreateGroupChatConversation(ctx context.Context, groupID string, userIDs []string) error
+	// GetConversationIDs retrieves conversation IDs for a given user.
 	GetConversationIDs(ctx context.Context, userID string) ([]string, error)
+	// GetUserConversationIDsHash gets the hash of conversation IDs for a given user.
 	GetUserConversationIDsHash(ctx context.Context, ownerUserID string) (hash uint64, err error)
+	// GetAllConversationIDs fetches all conversation IDs.
 	GetAllConversationIDs(ctx context.Context) ([]string, error)
-	GetUserAllHasReadSeqs(ctx context.Context, ownerUserID string) (map[string]int64, error)
+	// GetAllConversationIDsNumber returns the number of all conversation IDs.
+	GetAllConversationIDsNumber(ctx context.Context) (int64, error)
+	// PageConversationIDs paginates through conversation IDs based on the specified pagination settings.
+	PageConversationIDs(ctx context.Context, pagination pagination.Pagination) (conversationIDs []string, err error)
+	// GetConversationsByConversationID retrieves conversations by their IDs.
 	GetConversationsByConversationID(ctx context.Context, conversationIDs []string) ([]*relationtb.ConversationModel, error)
+	// GetConversationIDsNeedDestruct fetches conversations that need to be destructed based on specific criteria.
 	GetConversationIDsNeedDestruct(ctx context.Context) ([]*relationtb.ConversationModel, error)
+	// GetConversationNotReceiveMessageUserIDs gets user IDs for users in a conversation who have not received messages.
+	GetConversationNotReceiveMessageUserIDs(ctx context.Context, conversationID string) ([]string, error)
+	// GetUserAllHasReadSeqs(ctx context.Context, ownerUserID string) (map[string]int64, error)
+	// FindRecvMsgNotNotifyUserIDs(ctx context.Context, groupID string) ([]string, error)
 }
 
 func NewConversationDatabase(conversation relationtb.ConversationModelInterface, cache cache.ConversationCache, tx tx.Tx) ConversationDatabase {
@@ -69,33 +81,38 @@ type conversationDatabase struct {
 	tx             tx.Tx
 }
 
-func (c *conversationDatabase) SetUsersConversationFiledTx(ctx context.Context, userIDs []string, conversation *relationtb.ConversationModel, filedMap map[string]interface{}) (err error) {
-	cache := c.cache.NewCache()
-	if err := c.tx.Transaction(func(tx any) error {
-		conversationTx := c.conversationDB.NewTx(tx)
-		haveUserIDs, err := conversationTx.FindUserID(ctx, userIDs, []string{conversation.ConversationID})
+func (c *conversationDatabase) SetUsersConversationFieldTx(ctx context.Context, userIDs []string, conversation *relationtb.ConversationModel, fieldMap map[string]any) (err error) {
+	return c.tx.Transaction(ctx, func(ctx context.Context) error {
+		cache := c.cache.NewCache()
+		if conversation.GroupID != "" {
+			cache = cache.DelSuperGroupRecvMsgNotNotifyUserIDs(conversation.GroupID).DelSuperGroupRecvMsgNotNotifyUserIDsHash(conversation.GroupID)
+		}
+		haveUserIDs, err := c.conversationDB.FindUserID(ctx, userIDs, []string{conversation.ConversationID})
 		if err != nil {
 			return err
 		}
 		if len(haveUserIDs) > 0 {
-			_, err = conversationTx.UpdateByMap(ctx, haveUserIDs, conversation.ConversationID, filedMap)
+			_, err = c.conversationDB.UpdateByMap(ctx, haveUserIDs, conversation.ConversationID, fieldMap)
 			if err != nil {
 				return err
 			}
 			cache = cache.DelUsersConversation(conversation.ConversationID, haveUserIDs...)
-			if _, ok := filedMap["has_read_seq"]; ok {
+			if _, ok := fieldMap["has_read_seq"]; ok {
 				for _, userID := range haveUserIDs {
 					cache = cache.DelUserAllHasReadSeqs(userID, conversation.ConversationID)
 				}
 			}
+			if _, ok := fieldMap["recv_msg_opt"]; ok {
+				cache = cache.DelConversationNotReceiveMessageUserIDs(conversation.ConversationID)
+			}
 		}
-		NotUserIDs := utils.DifferenceString(haveUserIDs, userIDs)
-		log.ZDebug(ctx, "SetUsersConversationFiledTx", "NotUserIDs", NotUserIDs, "haveUserIDs", haveUserIDs, "userIDs", userIDs)
+		NotUserIDs := stringutil.DifferenceString(haveUserIDs, userIDs)
+		log.ZDebug(ctx, "SetUsersConversationFieldTx", "NotUserIDs", NotUserIDs, "haveUserIDs", haveUserIDs, "userIDs", userIDs)
 		var conversations []*relationtb.ConversationModel
 		now := time.Now()
 		for _, v := range NotUserIDs {
 			temp := new(relationtb.ConversationModel)
-			if err := utils.CopyStructFields(temp, conversation); err != nil {
+			if err = datautil.CopyStructFields(temp, conversation); err != nil {
 				return err
 			}
 			temp.OwnerUserID = v
@@ -103,25 +120,27 @@ func (c *conversationDatabase) SetUsersConversationFiledTx(ctx context.Context, 
 			conversations = append(conversations, temp)
 		}
 		if len(conversations) > 0 {
-			err = conversationTx.Create(ctx, conversations)
+			err = c.conversationDB.Create(ctx, conversations)
 			if err != nil {
 				return err
 			}
 			cache = cache.DelConversationIDs(NotUserIDs...).DelUserConversationIDsHash(NotUserIDs...).DelConversations(conversation.ConversationID, NotUserIDs...)
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	return cache.ExecDel(ctx)
+		return cache.ExecDel(ctx)
+	})
 }
 
-func (c *conversationDatabase) UpdateUsersConversationFiled(ctx context.Context, userIDs []string, conversationID string, args map[string]interface{}) error {
+func (c *conversationDatabase) UpdateUsersConversationField(ctx context.Context, userIDs []string, conversationID string, args map[string]any) error {
 	_, err := c.conversationDB.UpdateByMap(ctx, userIDs, conversationID, args)
 	if err != nil {
 		return err
 	}
-	return c.cache.DelUsersConversation(conversationID, userIDs...).ExecDel(ctx)
+	cache := c.cache.NewCache()
+	cache = cache.DelUsersConversation(conversationID, userIDs...)
+	if _, ok := args["recv_msg_opt"]; ok {
+		cache = cache.DelConversationNotReceiveMessageUserIDs(conversationID)
+	}
+	return cache.ExecDel(ctx)
 }
 
 func (c *conversationDatabase) CreateConversation(ctx context.Context, conversations []*relationtb.ConversationModel) error {
@@ -132,25 +151,25 @@ func (c *conversationDatabase) CreateConversation(ctx context.Context, conversat
 	cache := c.cache.NewCache()
 	for _, conversation := range conversations {
 		cache = cache.DelConversations(conversation.OwnerUserID, conversation.ConversationID)
+		cache = cache.DelConversationNotReceiveMessageUserIDs(conversation.ConversationID)
 		userIDs = append(userIDs, conversation.OwnerUserID)
 	}
 	return cache.DelConversationIDs(userIDs...).DelUserConversationIDsHash(userIDs...).ExecDel(ctx)
 }
 
 func (c *conversationDatabase) SyncPeerUserPrivateConversationTx(ctx context.Context, conversations []*relationtb.ConversationModel) error {
-	cache := c.cache.NewCache()
-	if err := c.tx.Transaction(func(tx any) error {
-		conversationTx := c.conversationDB.NewTx(tx)
+	return c.tx.Transaction(ctx, func(ctx context.Context) error {
+		cache := c.cache.NewCache()
 		for _, conversation := range conversations {
 			for _, v := range [][2]string{{conversation.OwnerUserID, conversation.UserID}, {conversation.UserID, conversation.OwnerUserID}} {
 				ownerUserID := v[0]
 				userID := v[1]
-				haveUserIDs, err := conversationTx.FindUserID(ctx, []string{ownerUserID}, []string{conversation.ConversationID})
+				haveUserIDs, err := c.conversationDB.FindUserID(ctx, []string{ownerUserID}, []string{conversation.ConversationID})
 				if err != nil {
 					return err
 				}
 				if len(haveUserIDs) > 0 {
-					_, err := conversationTx.UpdateByMap(ctx, []string{ownerUserID}, conversation.ConversationID, map[string]interface{}{"is_private_chat": conversation.IsPrivateChat})
+					_, err := c.conversationDB.UpdateByMap(ctx, []string{ownerUserID}, conversation.ConversationID, map[string]any{"is_private_chat": conversation.IsPrivateChat})
 					if err != nil {
 						return err
 					}
@@ -161,18 +180,15 @@ func (c *conversationDatabase) SyncPeerUserPrivateConversationTx(ctx context.Con
 					newConversation.UserID = userID
 					newConversation.ConversationID = conversation.ConversationID
 					newConversation.IsPrivateChat = conversation.IsPrivateChat
-					if err := conversationTx.Create(ctx, []*relationtb.ConversationModel{&newConversation}); err != nil {
+					if err := c.conversationDB.Create(ctx, []*relationtb.ConversationModel{&newConversation}); err != nil {
 						return err
 					}
 					cache = cache.DelConversationIDs(ownerUserID).DelUserConversationIDsHash(ownerUserID)
 				}
 			}
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	return cache.ExecDel(ctx)
+		return cache.ExecDel(ctx)
+	})
 }
 
 func (c *conversationDatabase) FindConversations(ctx context.Context, ownerUserID string, conversationIDs []string) ([]*relationtb.ConversationModel, error) {
@@ -188,21 +204,26 @@ func (c *conversationDatabase) GetUserAllConversation(ctx context.Context, owner
 }
 
 func (c *conversationDatabase) SetUserConversations(ctx context.Context, ownerUserID string, conversations []*relationtb.ConversationModel) error {
-	cache := c.cache.NewCache()
-	if err := c.tx.Transaction(func(tx any) error {
+	return c.tx.Transaction(ctx, func(ctx context.Context) error {
+		cache := c.cache.NewCache()
+		groupIDs := datautil.Distinct(datautil.Filter(conversations, func(e *relationtb.ConversationModel) (string, bool) {
+			return e.GroupID, e.GroupID != ""
+		}))
+		for _, groupID := range groupIDs {
+			cache = cache.DelSuperGroupRecvMsgNotNotifyUserIDs(groupID).DelSuperGroupRecvMsgNotNotifyUserIDsHash(groupID)
+		}
 		var conversationIDs []string
 		for _, conversation := range conversations {
 			conversationIDs = append(conversationIDs, conversation.ConversationID)
 			cache = cache.DelConversations(conversation.OwnerUserID, conversation.ConversationID)
 		}
-		conversationTx := c.conversationDB.NewTx(tx)
-		existConversations, err := conversationTx.Find(ctx, ownerUserID, conversationIDs)
+		existConversations, err := c.conversationDB.Find(ctx, ownerUserID, conversationIDs)
 		if err != nil {
 			return err
 		}
 		if len(existConversations) > 0 {
 			for _, conversation := range conversations {
-				err = conversationTx.Update(ctx, conversation)
+				err = c.conversationDB.Update(ctx, conversation)
 				if err != nil {
 					return err
 				}
@@ -215,7 +236,7 @@ func (c *conversationDatabase) SetUserConversations(ctx context.Context, ownerUs
 
 		var notExistConversations []*relationtb.ConversationModel
 		for _, conversation := range conversations {
-			if !utils.IsContain(conversation.ConversationID, existConversationIDs) {
+			if !datautil.Contain(conversation.ConversationID, existConversationIDs...) {
 				notExistConversations = append(notExistConversations, conversation)
 			}
 		}
@@ -224,33 +245,32 @@ func (c *conversationDatabase) SetUserConversations(ctx context.Context, ownerUs
 			if err != nil {
 				return err
 			}
-			cache = cache.DelConversationIDs(ownerUserID).DelUserConversationIDsHash(ownerUserID)
+			cache = cache.DelConversationIDs(ownerUserID).
+				DelUserConversationIDsHash(ownerUserID).
+				DelConversationNotReceiveMessageUserIDs(datautil.Slice(notExistConversations, func(e *relationtb.ConversationModel) string { return e.ConversationID })...)
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	return cache.ExecDel(ctx)
+		return cache.ExecDel(ctx)
+	})
 }
 
-func (c *conversationDatabase) FindRecvMsgNotNotifyUserIDs(ctx context.Context, groupID string) ([]string, error) {
-	return c.cache.GetSuperGroupRecvMsgNotNotifyUserIDs(ctx, groupID)
-}
+// func (c *conversationDatabase) FindRecvMsgNotNotifyUserIDs(ctx context.Context, groupID string) ([]string, error) {
+//	return c.cache.GetSuperGroupRecvMsgNotNotifyUserIDs(ctx, groupID)
+//}
 
 func (c *conversationDatabase) CreateGroupChatConversation(ctx context.Context, groupID string, userIDs []string) error {
-	cache := c.cache.NewCache()
-	conversationID := msgprocessor.GetConversationIDBySessionType(constant.SuperGroupChatType, groupID)
-	if err := c.tx.Transaction(func(tx any) error {
+	return c.tx.Transaction(ctx, func(ctx context.Context) error {
+		cache := c.cache.NewCache()
+		conversationID := msgprocessor.GetConversationIDBySessionType(constant.ReadGroupChatType, groupID)
 		existConversationUserIDs, err := c.conversationDB.FindUserID(ctx, userIDs, []string{conversationID})
 		if err != nil {
 			return err
 		}
-		notExistUserIDs := utils.DifferenceString(userIDs, existConversationUserIDs)
+		notExistUserIDs := stringutil.DifferenceString(userIDs, existConversationUserIDs)
 		var conversations []*relationtb.ConversationModel
 		for _, v := range notExistUserIDs {
-			conversation := relationtb.ConversationModel{ConversationType: constant.SuperGroupChatType, GroupID: groupID, OwnerUserID: v, ConversationID: conversationID}
+			conversation := relationtb.ConversationModel{ConversationType: constant.ReadGroupChatType, GroupID: groupID, OwnerUserID: v, ConversationID: conversationID}
 			conversations = append(conversations, &conversation)
-			cache = cache.DelConversations(v, conversationID)
+			cache = cache.DelConversations(v, conversationID).DelConversationNotReceiveMessageUserIDs(conversationID)
 		}
 		cache = cache.DelConversationIDs(notExistUserIDs...).DelUserConversationIDsHash(notExistUserIDs...)
 		if len(conversations) > 0 {
@@ -259,18 +279,15 @@ func (c *conversationDatabase) CreateGroupChatConversation(ctx context.Context, 
 				return err
 			}
 		}
-		_, err = c.conversationDB.UpdateByMap(ctx, existConversationUserIDs, conversationID, map[string]interface{}{"max_seq": 0})
+		_, err = c.conversationDB.UpdateByMap(ctx, existConversationUserIDs, conversationID, map[string]any{"max_seq": 0})
 		if err != nil {
 			return err
 		}
 		for _, v := range existConversationUserIDs {
 			cache = cache.DelConversations(v, conversationID)
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	return cache.ExecDel(ctx)
+		return cache.ExecDel(ctx)
+	})
 }
 
 func (c *conversationDatabase) GetConversationIDs(ctx context.Context, userID string) ([]string, error) {
@@ -285,8 +302,12 @@ func (c *conversationDatabase) GetAllConversationIDs(ctx context.Context) ([]str
 	return c.conversationDB.GetAllConversationIDs(ctx)
 }
 
-func (c *conversationDatabase) GetUserAllHasReadSeqs(ctx context.Context, ownerUserID string) (map[string]int64, error) {
-	return c.cache.GetUserAllHasReadSeqs(ctx, ownerUserID)
+func (c *conversationDatabase) GetAllConversationIDsNumber(ctx context.Context) (int64, error) {
+	return c.conversationDB.GetAllConversationIDsNumber(ctx)
+}
+
+func (c *conversationDatabase) PageConversationIDs(ctx context.Context, pagination pagination.Pagination) ([]string, error) {
+	return c.conversationDB.PageConversationIDs(ctx, pagination)
 }
 
 func (c *conversationDatabase) GetConversationsByConversationID(ctx context.Context, conversationIDs []string) ([]*relationtb.ConversationModel, error) {
@@ -295,4 +316,8 @@ func (c *conversationDatabase) GetConversationsByConversationID(ctx context.Cont
 
 func (c *conversationDatabase) GetConversationIDsNeedDestruct(ctx context.Context) ([]*relationtb.ConversationModel, error) {
 	return c.conversationDB.GetConversationIDsNeedDestruct(ctx)
+}
+
+func (c *conversationDatabase) GetConversationNotReceiveMessageUserIDs(ctx context.Context, conversationID string) ([]string, error) {
+	return c.cache.GetConversationNotReceiveMessageUserIDs(ctx, conversationID)
 }

@@ -15,18 +15,20 @@
 package api
 
 import (
+	"context"
+	"google.golang.org/grpc"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
-
-	"github.com/OpenIMSDK/protocol/third"
-	"github.com/OpenIMSDK/tools/a2r"
-	"github.com/OpenIMSDK/tools/errs"
-	"github.com/OpenIMSDK/tools/mcontext"
-
 	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
+	"github.com/openimsdk/protocol/third"
+	"github.com/openimsdk/tools/a2r"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/mcontext"
 )
 
 type ThirdApi rpcclient.Third
@@ -45,6 +47,35 @@ func (o *ThirdApi) SetAppBadge(c *gin.Context) {
 
 // #################### s3 ####################
 
+func setURLPrefixOption[A, B, C any](_ func(client C, ctx context.Context, req *A, options ...grpc.CallOption) (*B, error), fn func(*A) error) *a2r.Option[A, B] {
+	return &a2r.Option[A, B]{
+		BindAfter: fn,
+	}
+}
+
+func setURLPrefix(c *gin.Context, urlPrefix *string) error {
+	host := c.GetHeader("X-Request-Api")
+	if host != "" {
+		if strings.HasSuffix(host, "/") {
+			*urlPrefix = host + "object/"
+			return nil
+		} else {
+			*urlPrefix = host + "/object/"
+			return nil
+		}
+	}
+	u := url.URL{
+		Scheme: "http",
+		Host:   c.Request.Host,
+		Path:   "/object/",
+	}
+	if c.Request.TLS != nil {
+		u.Scheme = "https"
+	}
+	*urlPrefix = u.String()
+	return nil
+}
+
 func (o *ThirdApi) PartLimit(c *gin.Context) {
 	a2r.Call(third.ThirdClient.PartLimit, o.Client, c)
 }
@@ -54,7 +85,10 @@ func (o *ThirdApi) PartSize(c *gin.Context) {
 }
 
 func (o *ThirdApi) InitiateMultipartUpload(c *gin.Context) {
-	a2r.Call(third.ThirdClient.InitiateMultipartUpload, o.Client, c)
+	opt := setURLPrefixOption(third.ThirdClient.InitiateMultipartUpload, func(req *third.InitiateMultipartUploadReq) error {
+		return setURLPrefix(c, &req.UrlPrefix)
+	})
+	a2r.Call(third.ThirdClient.InitiateMultipartUpload, o.Client, c, opt)
 }
 
 func (o *ThirdApi) AuthSign(c *gin.Context) {
@@ -62,11 +96,25 @@ func (o *ThirdApi) AuthSign(c *gin.Context) {
 }
 
 func (o *ThirdApi) CompleteMultipartUpload(c *gin.Context) {
-	a2r.Call(third.ThirdClient.CompleteMultipartUpload, o.Client, c)
+	opt := setURLPrefixOption(third.ThirdClient.CompleteMultipartUpload, func(req *third.CompleteMultipartUploadReq) error {
+		return setURLPrefix(c, &req.UrlPrefix)
+	})
+	a2r.Call(third.ThirdClient.CompleteMultipartUpload, o.Client, c, opt)
 }
 
 func (o *ThirdApi) AccessURL(c *gin.Context) {
 	a2r.Call(third.ThirdClient.AccessURL, o.Client, c)
+}
+
+func (o *ThirdApi) InitiateFormData(c *gin.Context) {
+	a2r.Call(third.ThirdClient.InitiateFormData, o.Client, c)
+}
+
+func (o *ThirdApi) CompleteFormData(c *gin.Context) {
+	opt := setURLPrefixOption(third.ThirdClient.CompleteFormData, func(req *third.CompleteFormDataReq) error {
+		return setURLPrefix(c, &req.UrlPrefix)
+	})
+	a2r.Call(third.ThirdClient.CompleteFormData, o.Client, c, opt)
 }
 
 func (o *ThirdApi) ObjectRedirect(c *gin.Context) {
@@ -104,4 +152,21 @@ func (o *ThirdApi) ObjectRedirect(c *gin.Context) {
 		return
 	}
 	c.Redirect(http.StatusFound, resp.Url)
+}
+
+// #################### logs ####################.
+func (o *ThirdApi) UploadLogs(c *gin.Context) {
+	a2r.Call(third.ThirdClient.UploadLogs, o.Client, c)
+}
+
+func (o *ThirdApi) DeleteLogs(c *gin.Context) {
+	a2r.Call(third.ThirdClient.DeleteLogs, o.Client, c)
+}
+
+func (o *ThirdApi) SearchLogs(c *gin.Context) {
+	a2r.Call(third.ThirdClient.SearchLogs, o.Client, c)
+}
+
+func (o *ThirdApi) GetPrometheus(c *gin.Context) {
+	c.Redirect(http.StatusFound, o.GrafanaUrl)
 }

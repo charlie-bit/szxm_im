@@ -16,11 +16,9 @@ package api
 
 import (
 	"github.com/gin-gonic/gin"
-
-	"github.com/OpenIMSDK/protocol/conversation"
-	"github.com/OpenIMSDK/tools/a2r"
-
 	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
+	"github.com/openimsdk/protocol/conversation"
+	"github.com/openimsdk/tools/a2r"
 )
 
 type ConversationApi rpcclient.Conversation
@@ -33,6 +31,10 @@ func (o *ConversationApi) GetAllConversations(c *gin.Context) {
 	a2r.Call(conversation.ConversationClient.GetAllConversations, o.Client, c)
 }
 
+func (o *ConversationApi) GetSortedConversationList(c *gin.Context) {
+	a2r.Call(conversation.ConversationClient.GetSortedConversationList, o.Client, c)
+}
+
 func (o *ConversationApi) GetConversation(c *gin.Context) {
 	a2r.Call(conversation.ConversationClient.GetConversation, o.Client, c)
 }
@@ -43,4 +45,8 @@ func (o *ConversationApi) GetConversations(c *gin.Context) {
 
 func (o *ConversationApi) SetConversations(c *gin.Context) {
 	a2r.Call(conversation.ConversationClient.SetConversations, o.Client, c)
+}
+
+func (o *ConversationApi) GetConversationOfflinePushUserIDs(c *gin.Context) {
+	a2r.Call(conversation.ConversationClient.GetConversationOfflinePushUserIDs, o.Client, c)
 }

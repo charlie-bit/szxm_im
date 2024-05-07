@@ -16,19 +16,23 @@ package third
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"path"
 	"strconv"
 	"time"
 
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/s3"
-
-	"github.com/OpenIMSDK/protocol/third"
-	"github.com/OpenIMSDK/tools/errs"
-	"github.com/OpenIMSDK/tools/log"
-	"github.com/OpenIMSDK/tools/mcontext"
-	"github.com/OpenIMSDK/tools/utils"
-
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/s3/cont"
+	"github.com/google/uuid"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/db/table/relation"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/servererrs"
+	"github.com/openimsdk/protocol/third"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/log"
+	"github.com/openimsdk/tools/mcontext"
+	"github.com/openimsdk/tools/s3"
+	"github.com/openimsdk/tools/s3/cont"
+	"github.com/openimsdk/tools/utils/datautil"
 )
 
 func (t *thirdServer) PartLimit(ctx context.Context, req *third.PartLimitReq) (*third.PartLimitResp, error) {
@@ -49,8 +53,7 @@ func (t *thirdServer) PartSize(ctx context.Context, req *third.PartSizeReq) (*th
 }
 
 func (t *thirdServer) InitiateMultipartUpload(ctx context.Context, req *third.InitiateMultipartUploadReq) (*third.InitiateMultipartUploadResp, error) {
-	defer log.ZDebug(ctx, "return")
-	if err := checkUploadName(ctx, req.Name); err != nil {
+	if err := t.checkUploadName(ctx, req.Name); err != nil {
 		return nil, err
 	}
 	expireTime := time.Now().Add(t.defaultExpire)
@@ -64,14 +67,14 @@ func (t *thirdServer) InitiateMultipartUpload(ctx context.Context, req *third.In
 				Key:         haErr.Object.Key,
 				Size:        haErr.Object.Size,
 				ContentType: req.ContentType,
-				Cause:       req.Cause,
+				Group:       req.Cause,
 				CreateTime:  time.Now(),
 			}
 			if err := t.s3dataBase.SetObject(ctx, obj); err != nil {
 				return nil, err
 			}
 			return &third.InitiateMultipartUploadResp{
-				Url: t.apiAddress(obj.Name),
+				Url: t.apiAddress(req.UrlPrefix, obj.Name),
 			}, nil
 		}
 		return nil, err
@@ -104,8 +107,7 @@ func (t *thirdServer) InitiateMultipartUpload(ctx context.Context, req *third.In
 }
 
 func (t *thirdServer) AuthSign(ctx context.Context, req *third.AuthSignReq) (*third.AuthSignResp, error) {
-	defer log.ZDebug(ctx, "return")
-	partNumbers := utils.Slice(req.PartNumbers, func(partNumber int32) int { return int(partNumber) })
+	partNumbers := datautil.Slice(req.PartNumbers, func(partNumber int32) int { return int(partNumber) })
 	result, err := t.s3dataBase.AuthSign(ctx, req.UploadID, partNumbers)
 	if err != nil {
 		return nil, err
@@ -128,8 +130,7 @@ func (t *thirdServer) AuthSign(ctx context.Context, req *third.AuthSignReq) (*th
 }
 
 func (t *thirdServer) CompleteMultipartUpload(ctx context.Context, req *third.CompleteMultipartUploadReq) (*third.CompleteMultipartUploadResp, error) {
-	defer log.ZDebug(ctx, "return")
-	if err := checkUploadName(ctx, req.Name); err != nil {
+	if err := t.checkUploadName(ctx, req.Name); err != nil {
 		return nil, err
 	}
 	result, err := t.s3dataBase.CompleteMultipartUpload(ctx, req.UploadID, req.Parts)
@@ -143,14 +144,14 @@ func (t *thirdServer) CompleteMultipartUpload(ctx context.Context, req *third.Co
 		Key:         result.Key,
 		Size:        result.Size,
 		ContentType: req.ContentType,
-		Cause:       req.Cause,
+		Group:       req.Cause,
 		CreateTime:  time.Now(),
 	}
 	if err := t.s3dataBase.SetObject(ctx, obj); err != nil {
 		return nil, err
 	}
 	return &third.CompleteMultipartUploadResp{
-		Url: t.apiAddress(obj.Name),
+		Url: t.apiAddress(req.UrlPrefix, obj.Name),
 	}, nil
 }
 
@@ -166,7 +167,7 @@ func (t *thirdServer) AccessURL(ctx context.Context, req *third.AccessURLReq) (*
 			opt.Image.Height, _ = strconv.Atoi(req.Query["height"])
 			log.ZDebug(ctx, "AccessURL image", "name", req.Name, "option", opt.Image)
 		default:
-			return nil, errs.ErrArgs.Wrap("invalid query type")
+			return nil, errs.ErrArgs.WrapMsg("invalid query type")
 		}
 	}
 	expireTime, rawURL, err := t.s3dataBase.AccessURL(ctx, req.Name, t.defaultExpire, opt)
@@ -179,6 +180,113 @@ func (t *thirdServer) AccessURL(ctx context.Context, req *third.AccessURLReq) (*
 	}, nil
 }
 
-func (t *thirdServer) apiAddress(name string) string {
-	return t.apiURL + name
+func (t *thirdServer) InitiateFormData(ctx context.Context, req *third.InitiateFormDataReq) (*third.InitiateFormDataResp, error) {
+	if req.Name == "" {
+		return nil, errs.ErrArgs.WrapMsg("name is empty")
+	}
+	if req.Size <= 0 {
+		return nil, errs.ErrArgs.WrapMsg("size must be greater than 0")
+	}
+	if err := t.checkUploadName(ctx, req.Name); err != nil {
+		return nil, err
+	}
+	var duration time.Duration
+	opUserID := mcontext.GetOpUserID(ctx)
+	var key string
+	if t.IsManagerUserID(opUserID) {
+		if req.Millisecond <= 0 {
+			duration = time.Minute * 10
+		} else {
+			duration = time.Millisecond * time.Duration(req.Millisecond)
+		}
+		if req.Absolute {
+			key = req.Name
+		}
+	} else {
+		duration = time.Minute * 10
+	}
+	uid, err := uuid.NewRandom()
+	if err != nil {
+		return nil, errs.WrapMsg(err, "uuid NewRandom failed")
+	}
+	if key == "" {
+		date := time.Now().Format("20060102")
+		key = path.Join(cont.DirectPath, date, opUserID, hex.EncodeToString(uid[:])+path.Ext(req.Name))
+	}
+	mate := FormDataMate{
+		Name:        req.Name,
+		Size:        req.Size,
+		ContentType: req.ContentType,
+		Group:       req.Group,
+		Key:         key,
+	}
+	mateData, err := json.Marshal(&mate)
+	if err != nil {
+		return nil, errs.WrapMsg(err, "marshal failed")
+	}
+	resp, err := t.s3dataBase.FormData(ctx, key, req.Size, req.ContentType, duration)
+	if err != nil {
+		return nil, err
+	}
+	return &third.InitiateFormDataResp{
+		Id:       base64.RawStdEncoding.EncodeToString(mateData),
+		Url:      resp.URL,
+		File:     resp.File,
+		Header:   toPbMapArray(resp.Header),
+		FormData: resp.FormData,
+		Expires:  resp.Expires.UnixMilli(),
+		SuccessCodes: datautil.Slice(resp.SuccessCodes, func(code int) int32 {
+			return int32(code)
+		}),
+	}, nil
+}
+
+func (t *thirdServer) CompleteFormData(ctx context.Context, req *third.CompleteFormDataReq) (*third.CompleteFormDataResp, error) {
+	if req.Id == "" {
+		return nil, errs.ErrArgs.WrapMsg("id is empty")
+	}
+	data, err := base64.RawStdEncoding.DecodeString(req.Id)
+	if err != nil {
+		return nil, errs.ErrArgs.WrapMsg("invalid id " + err.Error())
+	}
+	var mate FormDataMate
+	if err := json.Unmarshal(data, &mate); err != nil {
+		return nil, errs.ErrArgs.WrapMsg("invalid id " + err.Error())
+	}
+	if err := t.checkUploadName(ctx, mate.Name); err != nil {
+		return nil, err
+	}
+	info, err := t.s3dataBase.StatObject(ctx, mate.Key)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size > 0 && info.Size != mate.Size {
+		return nil, servererrs.ErrData.WrapMsg("file size mismatch")
+	}
+	obj := &relation.ObjectModel{
+		Name:        mate.Name,
+		UserID:      mcontext.GetOpUserID(ctx),
+		Hash:        "etag_" + info.ETag,
+		Key:         info.Key,
+		Size:        info.Size,
+		ContentType: mate.ContentType,
+		Group:       mate.Group,
+		CreateTime:  time.Now(),
+	}
+	if err := t.s3dataBase.SetObject(ctx, obj); err != nil {
+		return nil, err
+	}
+	return &third.CompleteFormDataResp{Url: t.apiAddress(req.UrlPrefix, mate.Name)}, nil
+}
+
+func (t *thirdServer) apiAddress(prefix, name string) string {
+	return prefix + name
+}
+
+type FormDataMate struct {
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"contentType"`
+	Group       string `json:"group"`
+	Key         string `json:"key"`
 }

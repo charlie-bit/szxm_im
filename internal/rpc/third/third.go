@@ -17,82 +17,84 @@ package third
 import (
 	"context"
 	"fmt"
-	"net/url"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
 	"time"
 
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/s3"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/s3/cos"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/s3/minio"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/s3/oss"
-
-	"google.golang.org/grpc"
-
-	"github.com/OpenIMSDK/protocol/third"
-	"github.com/OpenIMSDK/tools/discoveryregistry"
-
-	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/db/cache"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/db/controller"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/db/relation"
-	relationtb "github.com/openimsdk/open-im-server/v3/pkg/common/db/table/relation"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/db/mgo"
 	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
+	"github.com/openimsdk/protocol/third"
+	"github.com/openimsdk/tools/db/mongoutil"
+	"github.com/openimsdk/tools/db/redisutil"
+	"github.com/openimsdk/tools/discovery"
+	"github.com/openimsdk/tools/s3"
+	"github.com/openimsdk/tools/s3/cos"
+	"github.com/openimsdk/tools/s3/minio"
+	"github.com/openimsdk/tools/s3/oss"
+	"google.golang.org/grpc"
 )
 
-func Start(client discoveryregistry.SvcDiscoveryRegistry, server *grpc.Server) error {
-	apiURL := config.Config.Object.ApiURL
-	if apiURL == "" {
-		return fmt.Errorf("api url is empty")
-	}
-	if _, err := url.Parse(config.Config.Object.ApiURL); err != nil {
-		return err
-	}
-	if apiURL[len(apiURL)-1] != '/' {
-		apiURL += "/"
-	}
-	apiURL += "object/"
-	rdb, err := cache.NewRedis()
+type thirdServer struct {
+	thirdDatabase controller.ThirdDatabase
+	s3dataBase    controller.S3Database
+	userRpcClient rpcclient.UserRpcClient
+	defaultExpire time.Duration
+	config        *Config
+}
+type Config struct {
+	RpcConfig          config.Third
+	RedisConfig        config.Redis
+	MongodbConfig      config.Mongo
+	ZookeeperConfig    config.ZooKeeper
+	NotificationConfig config.Notification
+	Share              config.Share
+	MinioConfig        config.Minio
+	LocalCacheConfig   config.LocalCache
+}
+
+func Start(ctx context.Context, config *Config, client discovery.SvcDiscoveryRegistry, server *grpc.Server) error {
+	mgocli, err := mongoutil.NewMongoDB(ctx, config.MongodbConfig.Build())
 	if err != nil {
 		return err
 	}
-	db, err := relation.NewGormDB()
+	rdb, err := redisutil.NewRedisClient(ctx, config.RedisConfig.Build())
 	if err != nil {
 		return err
 	}
-	if err := db.AutoMigrate(&relationtb.ObjectModel{}); err != nil {
+	logdb, err := mgo.NewLogMongo(mgocli.GetDB())
+	if err != nil {
 		return err
 	}
-	// 根据配置文件策略选择 oss 方式
-	enable := config.Config.Object.Enable
+	s3db, err := mgo.NewS3Mongo(mgocli.GetDB())
+	if err != nil {
+		return err
+	}
+	// Select the oss method according to the profile policy
+	enable := config.RpcConfig.Object.Enable
 	var o s3.Interface
-	switch config.Config.Object.Enable {
+	switch enable {
 	case "minio":
-		o, err = minio.NewMinio()
+		o, err = minio.NewMinio(ctx, cache.NewMinioCache(rdb), *config.MinioConfig.Build())
 	case "cos":
-		o, err = cos.NewCos()
+		o, err = cos.NewCos(*config.RpcConfig.Object.Cos.Build())
 	case "oss":
-		o, err = oss.NewOSS()
+		o, err = oss.NewOSS(*config.RpcConfig.Object.Oss.Build())
 	default:
 		err = fmt.Errorf("invalid object enable: %s", enable)
 	}
 	if err != nil {
 		return err
 	}
+	cache.InitLocalCache(&config.LocalCacheConfig)
 	third.RegisterThirdServer(server, &thirdServer{
-		apiURL:        apiURL,
-		thirdDatabase: controller.NewThirdDatabase(cache.NewMsgCacheModel(rdb)),
-		userRpcClient: rpcclient.NewUserRpcClient(client),
-		s3dataBase:    controller.NewS3Database(o, relation.NewObjectInfo(db)),
+		thirdDatabase: controller.NewThirdDatabase(cache.NewThirdCache(rdb), logdb),
+		userRpcClient: rpcclient.NewUserRpcClient(client, config.Share.RpcRegisterName.User, config.Share.IMAdminUserID),
+		s3dataBase:    controller.NewS3Database(rdb, o, s3db),
 		defaultExpire: time.Hour * 24 * 7,
+		config:        config,
 	})
 	return nil
-}
-
-type thirdServer struct {
-	apiURL        string
-	thirdDatabase controller.ThirdDatabase
-	s3dataBase    controller.S3Database
-	userRpcClient rpcclient.UserRpcClient
-	defaultExpire time.Duration
 }
 
 func (t *thirdServer) FcmUpdateToken(ctx context.Context, req *third.FcmUpdateTokenReq) (resp *third.FcmUpdateTokenResp, err error) {

@@ -15,26 +15,44 @@
 package cmd
 
 import (
-	"github.com/spf13/cobra"
-
+	"context"
 	"github.com/openimsdk/open-im-server/v3/internal/msgtransfer"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
+	"github.com/openimsdk/tools/system/program"
+	"github.com/spf13/cobra"
 )
 
 type MsgTransferCmd struct {
 	*RootCmd
+	ctx               context.Context
+	configMap         map[string]any
+	msgTransferConfig *msgtransfer.Config
 }
 
-func NewMsgTransferCmd() MsgTransferCmd {
-	return MsgTransferCmd{NewRootCmd("msgTransfer")}
-}
-
-func (m *MsgTransferCmd) addRunE() {
-	m.Command.RunE = func(cmd *cobra.Command, args []string) error {
-		return msgtransfer.StartTransfer(m.getPrometheusPortFlag(cmd))
+func NewMsgTransferCmd() *MsgTransferCmd {
+	var msgTransferConfig msgtransfer.Config
+	ret := &MsgTransferCmd{msgTransferConfig: &msgTransferConfig}
+	ret.configMap = map[string]any{
+		OpenIMMsgTransferCfgFileName: &msgTransferConfig.MsgTransfer,
+		RedisConfigFileName:          &msgTransferConfig.RedisConfig,
+		MongodbConfigFileName:        &msgTransferConfig.MongodbConfig,
+		KafkaConfigFileName:          &msgTransferConfig.KafkaConfig,
+		ZookeeperConfigFileName:      &msgTransferConfig.ZookeeperConfig,
+		ShareFileName:                &msgTransferConfig.Share,
+		WebhooksConfigFileName:       &msgTransferConfig.WebhooksConfig,
 	}
+	ret.RootCmd = NewRootCmd(program.GetProcessName(), WithConfigMap(ret.configMap))
+	ret.ctx = context.WithValue(context.Background(), "version", config.Version)
+	ret.Command.RunE = func(cmd *cobra.Command, args []string) error {
+		return ret.runE()
+	}
+	return ret
 }
 
 func (m *MsgTransferCmd) Exec() error {
-	m.addRunE()
 	return m.Execute()
+}
+
+func (m *MsgTransferCmd) runE() error {
+	return msgtransfer.Start(m.ctx, m.Index(), m.msgTransferConfig)
 }

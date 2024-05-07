@@ -16,17 +16,14 @@ package api
 
 import (
 	"github.com/gin-gonic/gin"
-
-	"github.com/OpenIMSDK/protocol/constant"
-	"github.com/OpenIMSDK/protocol/msggateway"
-	"github.com/OpenIMSDK/protocol/user"
-	"github.com/OpenIMSDK/tools/a2r"
-	"github.com/OpenIMSDK/tools/apiresp"
-	"github.com/OpenIMSDK/tools/errs"
-	"github.com/OpenIMSDK/tools/log"
-
-	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
 	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
+	"github.com/openimsdk/protocol/constant"
+	"github.com/openimsdk/protocol/msggateway"
+	"github.com/openimsdk/protocol/user"
+	"github.com/openimsdk/tools/a2r"
+	"github.com/openimsdk/tools/apiresp"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/log"
 )
 
 type UserApi rpcclient.User
@@ -42,7 +39,9 @@ func (u *UserApi) UserRegister(c *gin.Context) {
 func (u *UserApi) UpdateUserInfo(c *gin.Context) {
 	a2r.Call(user.UserClient.UpdateUserInfo, u.Client, c)
 }
-
+func (u *UserApi) UpdateUserInfoEx(c *gin.Context) {
+	a2r.Call(user.UserClient.UpdateUserInfoEx, u.Client, c)
+}
 func (u *UserApi) SetGlobalRecvMessageOpt(c *gin.Context) {
 	a2r.Call(user.UserClient.SetGlobalRecvMessageOpt, u.Client, c)
 }
@@ -67,10 +66,10 @@ func (u *UserApi) GetUsers(c *gin.Context) {
 func (u *UserApi) GetUsersOnlineStatus(c *gin.Context) {
 	var req msggateway.GetUsersOnlineStatusReq
 	if err := c.BindJSON(&req); err != nil {
-		apiresp.GinError(c, errs.ErrArgs.WithDetail(err.Error()).Wrap())
+		apiresp.GinError(c, err)
 		return
 	}
-	conns, err := u.Discov.GetConns(c, config.Config.RpcRegisterName.OpenImMessageGatewayName)
+	conns, err := u.Discov.GetConns(c, u.MessageGateWayRpcName)
 	if err != nil {
 		apiresp.GinError(c, err)
 		return
@@ -85,7 +84,7 @@ func (u *UserApi) GetUsersOnlineStatus(c *gin.Context) {
 		msgClient := msggateway.NewMsgGatewayClient(v)
 		reply, err := msgClient.GetUsersOnlineStatus(c, &req)
 		if err != nil {
-			log.ZWarn(c, "GetUsersOnlineStatus rpc err", err)
+			log.ZDebug(c, "GetUsersOnlineStatus rpc error", err)
 
 			parseError := apiresp.ParseError(err)
 			if parseError.ErrCode == errs.NoPermissionError {
@@ -134,7 +133,7 @@ func (u *UserApi) GetUsersOnlineTokenDetail(c *gin.Context) {
 		apiresp.GinError(c, errs.ErrArgs.WithDetail(err.Error()).Wrap())
 		return
 	}
-	conns, err := u.Discov.GetConns(c, config.Config.RpcRegisterName.OpenImMessageGatewayName)
+	conns, err := u.Discov.GetConns(c, u.MessageGateWayRpcName)
 	if err != nil {
 		apiresp.GinError(c, err)
 		return
@@ -144,7 +143,7 @@ func (u *UserApi) GetUsersOnlineTokenDetail(c *gin.Context) {
 		msgClient := msggateway.NewMsgGatewayClient(v)
 		reply, err := msgClient.GetUsersOnlineStatus(c, &req)
 		if err != nil {
-			log.ZWarn(c, "GetUsersOnlineStatus rpc  err", err)
+			log.ZWarn(c, "GetUsersOnlineStatus rpc err", err)
 			continue
 		} else {
 			wsResult = append(wsResult, reply.SuccessResult...)
@@ -190,11 +189,6 @@ func (u *UserApi) SubscriberStatus(c *gin.Context) {
 	a2r.Call(user.UserClient.SubscribeOrCancelUsersStatus, u.Client, c)
 }
 
-// UnSubscriberStatus Unsubscribe a user's presence.
-func (u *UserApi) UnSubscriberStatus(c *gin.Context) {
-	a2r.Call(user.UserClient.SubscribeOrCancelUsersStatus, u.Client, c)
-}
-
 // GetUserStatus Get the online status of the user.
 func (u *UserApi) GetUserStatus(c *gin.Context) {
 	a2r.Call(user.UserClient.GetUserStatus, u.Client, c)
@@ -203,4 +197,41 @@ func (u *UserApi) GetUserStatus(c *gin.Context) {
 // GetSubscribeUsersStatus Get the online status of subscribers.
 func (u *UserApi) GetSubscribeUsersStatus(c *gin.Context) {
 	a2r.Call(user.UserClient.GetSubscribeUsersStatus, u.Client, c)
+}
+
+// ProcessUserCommandAdd user general function add.
+func (u *UserApi) ProcessUserCommandAdd(c *gin.Context) {
+	a2r.Call(user.UserClient.ProcessUserCommandAdd, u.Client, c)
+}
+
+// ProcessUserCommandDelete user general function delete.
+func (u *UserApi) ProcessUserCommandDelete(c *gin.Context) {
+	a2r.Call(user.UserClient.ProcessUserCommandDelete, u.Client, c)
+}
+
+// ProcessUserCommandUpdate  user general function update.
+func (u *UserApi) ProcessUserCommandUpdate(c *gin.Context) {
+	a2r.Call(user.UserClient.ProcessUserCommandUpdate, u.Client, c)
+}
+
+// ProcessUserCommandGet user general function get.
+func (u *UserApi) ProcessUserCommandGet(c *gin.Context) {
+	a2r.Call(user.UserClient.ProcessUserCommandGet, u.Client, c)
+}
+
+// ProcessUserCommandGet user general function get all.
+func (u *UserApi) ProcessUserCommandGetAll(c *gin.Context) {
+	a2r.Call(user.UserClient.ProcessUserCommandGetAll, u.Client, c)
+}
+
+func (u *UserApi) AddNotificationAccount(c *gin.Context) {
+	a2r.Call(user.UserClient.AddNotificationAccount, u.Client, c)
+}
+
+func (u *UserApi) UpdateNotificationAccountInfo(c *gin.Context) {
+	a2r.Call(user.UserClient.UpdateNotificationAccountInfo, u.Client, c)
+}
+
+func (u *UserApi) SearchNotificationAccount(c *gin.Context) {
+	a2r.Call(user.UserClient.SearchNotificationAccount, u.Client, c)
 }

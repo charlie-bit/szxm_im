@@ -19,26 +19,24 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/openimsdk/open-im-server/v3/pkg/msgprocessor"
-
-	"github.com/OpenIMSDK/tools/errs"
 
 	"github.com/IBM/sarama"
 	"github.com/go-redis/redis"
-	"google.golang.org/protobuf/proto"
-
-	"github.com/OpenIMSDK/protocol/constant"
-	"github.com/OpenIMSDK/protocol/sdkws"
-	"github.com/OpenIMSDK/tools/log"
-	"github.com/OpenIMSDK/tools/mcontext"
-	"github.com/OpenIMSDK/tools/utils"
-
 	"github.com/openimsdk/open-im-server/v3/pkg/common/config"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/db/controller"
-	"github.com/openimsdk/open-im-server/v3/pkg/common/kafka"
+	"github.com/openimsdk/open-im-server/v3/pkg/msgprocessor"
 	"github.com/openimsdk/open-im-server/v3/pkg/rpcclient"
+	"github.com/openimsdk/protocol/constant"
+	"github.com/openimsdk/protocol/sdkws"
+	"github.com/openimsdk/tools/errs"
+	"github.com/openimsdk/tools/log"
+	"github.com/openimsdk/tools/mcontext"
+	"github.com/openimsdk/tools/mq/kafka"
+	"github.com/openimsdk/tools/utils/idutil"
+	"github.com/openimsdk/tools/utils/stringutil"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -61,7 +59,7 @@ type TriggerChannelValue struct {
 
 type Cmd2Value struct {
 	Cmd   int
-	Value interface{}
+	Value any
 }
 type ContextMsg struct {
 	message *sdkws.MsgData
@@ -73,21 +71,22 @@ type OnlineHistoryRedisConsumerHandler struct {
 	chArrays             [ChannelNum]chan Cmd2Value
 	msgDistributionCh    chan Cmd2Value
 
-	singleMsgSuccessCount      uint64
-	singleMsgFailedCount       uint64
-	singleMsgSuccessCountMutex sync.Mutex
-	singleMsgFailedCountMutex  sync.Mutex
+	// singleMsgSuccessCount      uint64
+	// singleMsgFailedCount       uint64
+	// singleMsgSuccessCountMutex sync.Mutex
+	// singleMsgFailedCountMutex  sync.Mutex
 
 	msgDatabase           controller.CommonMsgDatabase
 	conversationRpcClient *rpcclient.ConversationRpcClient
 	groupRpcClient        *rpcclient.GroupRpcClient
 }
 
-func NewOnlineHistoryRedisConsumerHandler(
-	database controller.CommonMsgDatabase,
-	conversationRpcClient *rpcclient.ConversationRpcClient,
-	groupRpcClient *rpcclient.GroupRpcClient,
-) *OnlineHistoryRedisConsumerHandler {
+func NewOnlineHistoryRedisConsumerHandler(kafkaConf *config.Kafka, database controller.CommonMsgDatabase,
+	conversationRpcClient *rpcclient.ConversationRpcClient, groupRpcClient *rpcclient.GroupRpcClient) (*OnlineHistoryRedisConsumerHandler, error) {
+	historyConsumerGroup, err := kafka.NewMConsumerGroup(kafkaConf.Build(), kafkaConf.ToRedisGroupID, []string{kafkaConf.ToRedisTopic})
+	if err != nil {
+		return nil, err
+	}
 	var och OnlineHistoryRedisConsumerHandler
 	och.msgDatabase = database
 	och.msgDistributionCh = make(chan Cmd2Value) // no buffer channel
@@ -98,79 +97,62 @@ func NewOnlineHistoryRedisConsumerHandler(
 	}
 	och.conversationRpcClient = conversationRpcClient
 	och.groupRpcClient = groupRpcClient
-	och.historyConsumerGroup = kafka.NewMConsumerGroup(&kafka.MConsumerGroupConfig{
-		KafkaVersion:   sarama.V2_0_0_0,
-		OffsetsInitial: sarama.OffsetNewest, IsReturnErr: false,
-	}, []string{config.Config.Kafka.LatestMsgToRedis.Topic},
-		config.Config.Kafka.Addr, config.Config.Kafka.ConsumerGroupID.MsgToRedis)
-	// statistics.NewStatistics(&och.singleMsgSuccessCount, config.Config.ModuleName.MsgTransferName, fmt.Sprintf("%d
-	// second singleMsgCount insert to mongo", constant.StatisticsTimeInterval), constant.StatisticsTimeInterval)
-	return &och
+	och.historyConsumerGroup = historyConsumerGroup
+	return &och, err
 }
 
 func (och *OnlineHistoryRedisConsumerHandler) Run(channelID int) {
-	for {
-		select {
-		case cmd := <-och.chArrays[channelID]:
-			switch cmd.Cmd {
-			case SourceMessages:
-				msgChannelValue := cmd.Value.(MsgChannelValue)
-				ctxMsgList := msgChannelValue.ctxMsgList
-				ctx := msgChannelValue.ctx
-				log.ZDebug(
-					ctx,
-					"msg arrived channel",
-					"channel id",
-					channelID,
-					"msgList length",
-					len(ctxMsgList),
-					"uniqueKey",
-					msgChannelValue.uniqueKey,
-				)
-				storageMsgList, notStorageMsgList, storageNotificationList, notStorageNotificationList, modifyMsgList := och.getPushStorageMsgList(
-					ctxMsgList,
-				)
-				log.ZDebug(
-					ctx,
-					"msg lens",
-					"storageMsgList",
-					len(storageMsgList),
-					"notStorageMsgList",
-					len(notStorageMsgList),
-					"storageNotificationList",
-					len(storageNotificationList),
-					"notStorageNotificationList",
-					len(notStorageNotificationList),
-					"modifyMsgList",
-					len(modifyMsgList),
-				)
-				conversationIDMsg := msgprocessor.GetChatConversationIDByMsg(ctxMsgList[0].message)
-				conversationIDNotification := msgprocessor.GetNotificationConversationIDByMsg(ctxMsgList[0].message)
-				och.handleMsg(ctx, msgChannelValue.uniqueKey, conversationIDMsg, storageMsgList, notStorageMsgList)
-				och.handleNotification(
-					ctx,
-					msgChannelValue.uniqueKey,
-					conversationIDNotification,
-					storageNotificationList,
-					notStorageNotificationList,
-				)
-				if err := och.msgDatabase.MsgToModifyMQ(ctx, msgChannelValue.uniqueKey, conversationIDNotification, modifyMsgList); err != nil {
-					log.ZError(
-						ctx,
-						"msg to modify mq error",
-						err,
-						"uniqueKey",
-						msgChannelValue.uniqueKey,
-						"modifyMsgList",
-						modifyMsgList,
-					)
-				}
+	for cmd := range och.chArrays[channelID] {
+		switch cmd.Cmd {
+		case SourceMessages:
+			msgChannelValue := cmd.Value.(MsgChannelValue)
+			ctxMsgList := msgChannelValue.ctxMsgList
+			ctx := msgChannelValue.ctx
+			log.ZDebug(
+				ctx,
+				"msg arrived channel",
+				"channel id",
+				channelID,
+				"msgList length",
+				len(ctxMsgList),
+				"uniqueKey",
+				msgChannelValue.uniqueKey,
+			)
+			storageMsgList, notStorageMsgList, storageNotificationList, notStorageNotificationList, modifyMsgList := och.getPushStorageMsgList(
+				ctxMsgList,
+			)
+			log.ZDebug(
+				ctx,
+				"msg lens",
+				"storageMsgList",
+				len(storageMsgList),
+				"notStorageMsgList",
+				len(notStorageMsgList),
+				"storageNotificationList",
+				len(storageNotificationList),
+				"notStorageNotificationList",
+				len(notStorageNotificationList),
+				"modifyMsgList",
+				len(modifyMsgList),
+			)
+			conversationIDMsg := msgprocessor.GetChatConversationIDByMsg(ctxMsgList[0].message)
+			conversationIDNotification := msgprocessor.GetNotificationConversationIDByMsg(ctxMsgList[0].message)
+			och.handleMsg(ctx, msgChannelValue.uniqueKey, conversationIDMsg, storageMsgList, notStorageMsgList)
+			och.handleNotification(
+				ctx,
+				msgChannelValue.uniqueKey,
+				conversationIDNotification,
+				storageNotificationList,
+				notStorageNotificationList,
+			)
+			if err := och.msgDatabase.MsgToModifyMQ(ctx, msgChannelValue.uniqueKey, conversationIDNotification, modifyMsgList); err != nil {
+				log.ZError(ctx, "msg to modify mq error", err, "uniqueKey", msgChannelValue.uniqueKey, "modifyMsgList", modifyMsgList)
 			}
 		}
 	}
 }
 
-// 获取消息/通知 存储的消息列表， 不存储并且推送的消息列表，.
+// Get messages/notifications stored message list, not stored and pushed message list.
 func (och *OnlineHistoryRedisConsumerHandler) getPushStorageMsgList(
 	totalMsgs []*ContextMsg,
 ) (storageMsgList, notStorageMsgList, storageNotificatoinList, notStorageNotificationList, modifyMsgList []*sdkws.MsgData) {
@@ -178,12 +160,11 @@ func (och *OnlineHistoryRedisConsumerHandler) getPushStorageMsgList(
 		options2 := msgprocessor.Options(msg.Options)
 		if options2.IsHistory() {
 			return true
-		} else {
-			// if !(!options2.IsSenderSync() && conversationID == msg.MsgData.SendID) {
-			// 	return false
-			// }
-			return false
 		}
+		// if !(!options2.IsSenderSync() && conversationID == msg.MsgData.SendID) {
+		// 	return false
+		// }
+		return false
 	}
 	for _, v := range totalMsgs {
 		options := msgprocessor.Options(v.message.Options)
@@ -191,7 +172,7 @@ func (och *OnlineHistoryRedisConsumerHandler) getPushStorageMsgList(
 			// clone msg from notificationMsg
 			if options.IsSendMsg() {
 				msg := proto.Clone(v.message).(*sdkws.MsgData)
-				// 消息
+				// message
 				if v.message.Options != nil {
 					msg.Options = msgprocessor.NewMsgOptions()
 				}
@@ -252,59 +233,61 @@ func (och *OnlineHistoryRedisConsumerHandler) handleNotification(
 			return
 		}
 		log.ZDebug(ctx, "success to next topic", "conversationID", conversationID)
-		och.msgDatabase.MsgToMongoMQ(ctx, key, conversationID, storageList, lastSeq)
+		err = och.msgDatabase.MsgToMongoMQ(ctx, key, conversationID, storageList, lastSeq)
+		if err != nil {
+			log.ZError(ctx, "MsgToMongoMQ error", err)
+		}
 		och.toPushTopic(ctx, key, conversationID, storageList)
 	}
 }
 
-func (och *OnlineHistoryRedisConsumerHandler) toPushTopic(
-	ctx context.Context,
-	key, conversationID string,
-	msgs []*sdkws.MsgData,
-) {
+func (och *OnlineHistoryRedisConsumerHandler) toPushTopic(ctx context.Context, key, conversationID string, msgs []*sdkws.MsgData) {
 	for _, v := range msgs {
-		och.msgDatabase.MsgToPushMQ(ctx, key, conversationID, v)
+		och.msgDatabase.MsgToPushMQ(ctx, key, conversationID, v) // nolint: errcheck
 	}
 }
 
-func (och *OnlineHistoryRedisConsumerHandler) handleMsg(
-	ctx context.Context,
-	key, conversationID string,
-	storageList, notStorageList []*sdkws.MsgData,
-) {
+func (och *OnlineHistoryRedisConsumerHandler) handleMsg(ctx context.Context, key, conversationID string, storageList, notStorageList []*sdkws.MsgData) {
 	och.toPushTopic(ctx, key, conversationID, notStorageList)
 	if len(storageList) > 0 {
 		lastSeq, isNewConversation, err := och.msgDatabase.BatchInsertChat2Cache(ctx, conversationID, storageList)
 		if err != nil && errs.Unwrap(err) != redis.Nil {
 			log.ZError(ctx, "batch data insert to redis err", err, "storageMsgList", storageList)
-			och.singleMsgFailedCountMutex.Lock()
-			och.singleMsgFailedCount += uint64(len(storageList))
-			och.singleMsgFailedCountMutex.Unlock()
 			return
 		}
 		if isNewConversation {
-			if storageList[0].SessionType == constant.SuperGroupChatType {
-				log.ZInfo(ctx, "group chat first create conversation", "conversationID", conversationID)
+			switch storageList[0].SessionType {
+			case constant.ReadGroupChatType:
+				log.ZInfo(ctx, "group chat first create conversation", "conversationID",
+					conversationID)
 				userIDs, err := och.groupRpcClient.GetGroupMemberIDs(ctx, storageList[0].GroupID)
 				if err != nil {
-					log.ZWarn(ctx, "get group member ids error", err, "conversationID", conversationID)
+					log.ZWarn(ctx, "get group member ids error", err, "conversationID",
+						conversationID)
 				} else {
-					if err := och.conversationRpcClient.GroupChatFirstCreateConversation(ctx, storageList[0].GroupID, userIDs); err != nil {
-						log.ZWarn(ctx, "single chat first create conversation error", err, "conversationID", conversationID)
+					if err := och.conversationRpcClient.GroupChatFirstCreateConversation(ctx,
+						storageList[0].GroupID, userIDs); err != nil {
+						log.ZWarn(ctx, "single chat first create conversation error", err,
+							"conversationID", conversationID)
 					}
 				}
-			} else {
-				if err := och.conversationRpcClient.SingleChatFirstCreateConversation(ctx, storageList[0].RecvID, storageList[0].SendID); err != nil {
-					log.ZWarn(ctx, "single chat first create conversation error", err, "conversationID", conversationID)
+			case constant.SingleChatType, constant.NotificationChatType:
+				if err := och.conversationRpcClient.SingleChatFirstCreateConversation(ctx, storageList[0].RecvID,
+					storageList[0].SendID, conversationID, storageList[0].SessionType); err != nil {
+					log.ZWarn(ctx, "single chat or notification first create conversation error", err,
+						"conversationID", conversationID, "sessionType", storageList[0].SessionType)
 				}
+			default:
+				log.ZWarn(ctx, "unknown session type", nil, "sessionType",
+					storageList[0].SessionType)
 			}
 		}
 
 		log.ZDebug(ctx, "success incr to next topic")
-		och.singleMsgSuccessCountMutex.Lock()
-		och.singleMsgSuccessCount += uint64(len(storageList))
-		och.singleMsgSuccessCountMutex.Unlock()
-		och.msgDatabase.MsgToMongoMQ(ctx, key, conversationID, storageList, lastSeq)
+		err = och.msgDatabase.MsgToMongoMQ(ctx, key, conversationID, storageList, lastSeq)
+		if err != nil {
+			log.ZError(ctx, "MsgToMongoMQ error", err)
+		}
 		och.toPushTopic(ctx, key, conversationID, storageList)
 	}
 }
@@ -333,14 +316,8 @@ func (och *OnlineHistoryRedisConsumerHandler) MessagesDistributionHandle() {
 					for i, header := range consumerMessages[i].Headers {
 						arr = append(arr, strconv.Itoa(i), string(header.Key), string(header.Value))
 					}
-					log.ZInfo(
-						ctx,
-						"consumer.kafka.GetContextWithMQHeader",
-						"len",
-						len(consumerMessages[i].Headers),
-						"header",
-						strings.Join(arr, ", "),
-					)
+					log.ZInfo(ctx, "consumer.kafka.GetContextWithMQHeader", "len", len(consumerMessages[i].Headers),
+						"header", strings.Join(arr, ", "))
 					ctxMsg.ctx = kafka.GetContextWithMQHeader(consumerMessages[i].Headers)
 					ctxMsg.message = msgFromMQ
 					log.ZDebug(
@@ -365,7 +342,7 @@ func (och *OnlineHistoryRedisConsumerHandler) MessagesDistributionHandle() {
 				log.ZDebug(ctx, "generate map list users len", "length", len(aggregationMsgs))
 				for uniqueKey, v := range aggregationMsgs {
 					if len(v) >= 0 {
-						hashCode := utils.GetHashCode(uniqueKey)
+						hashCode := stringutil.GetHashCode(uniqueKey)
 						channelID := hashCode % ChannelNum
 						newCtx := withAggregationCtx(ctx, v)
 						log.ZDebug(
@@ -417,49 +394,94 @@ func (och *OnlineHistoryRedisConsumerHandler) ConsumeClaim(
 			break
 		}
 	}
-	rwLock := new(sync.RWMutex)
-	log.ZDebug(context.Background(), "online new session msg come", "highWaterMarkOffset",
+	log.ZInfo(context.Background(), "online new session msg come", "highWaterMarkOffset",
 		claim.HighWaterMarkOffset(), "topic", claim.Topic(), "partition", claim.Partition())
-	cMsg := make([]*sarama.ConsumerMessage, 0, 1000)
-	t := time.NewTicker(time.Millisecond * 100)
+
+	var (
+		split    = 1000
+		rwLock   = new(sync.RWMutex)
+		messages = make([]*sarama.ConsumerMessage, 0, 1000)
+		ticker   = time.NewTicker(time.Millisecond * 100)
+
+		wg      = sync.WaitGroup{}
+		running = new(atomic.Bool)
+	)
+	running.Store(true)
+
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		for {
 			select {
-			case <-t.C:
-				if len(cMsg) > 0 {
-					rwLock.Lock()
-					ccMsg := make([]*sarama.ConsumerMessage, 0, 1000)
-					for _, v := range cMsg {
-						ccMsg = append(ccMsg, v)
+			case <-ticker.C:
+				// if the buffer is empty and running is false, return loop.
+				if len(messages) == 0 {
+					if !running.Load() {
+						return
 					}
-					cMsg = make([]*sarama.ConsumerMessage, 0, 1000)
-					rwLock.Unlock()
-					split := 1000
-					ctx := mcontext.WithTriggerIDContext(context.Background(), utils.OperationIDGenerator())
-					log.ZDebug(ctx, "timer trigger msg consumer start", "length", len(ccMsg))
-					for i := 0; i < len(ccMsg)/split; i++ {
-						// log.Debug()
-						och.msgDistributionCh <- Cmd2Value{Cmd: ConsumerMsgs, Value: TriggerChannelValue{
-							ctx: ctx, cMsgList: ccMsg[i*split : (i+1)*split],
-						}}
-					}
-					if (len(ccMsg) % split) > 0 {
-						och.msgDistributionCh <- Cmd2Value{Cmd: ConsumerMsgs, Value: TriggerChannelValue{
-							ctx: ctx, cMsgList: ccMsg[split*(len(ccMsg)/split):],
-						}}
-					}
-					log.ZDebug(ctx, "timer trigger msg consumer end", "length", len(ccMsg))
+
+					continue
 				}
+
+				rwLock.Lock()
+				buffer := make([]*sarama.ConsumerMessage, 0, len(messages))
+				buffer = append(buffer, messages...)
+
+				// reuse slice, set cap to 0
+				messages = messages[:0]
+				rwLock.Unlock()
+
+				start := time.Now()
+				ctx := mcontext.WithTriggerIDContext(context.Background(), idutil.OperationIDGenerator())
+				log.ZDebug(ctx, "timer trigger msg consumer start", "length", len(buffer))
+				for i := 0; i < len(buffer)/split; i++ {
+					och.msgDistributionCh <- Cmd2Value{Cmd: ConsumerMsgs, Value: TriggerChannelValue{
+						ctx: ctx, cMsgList: buffer[i*split : (i+1)*split],
+					}}
+				}
+				if (len(buffer) % split) > 0 {
+					och.msgDistributionCh <- Cmd2Value{Cmd: ConsumerMsgs, Value: TriggerChannelValue{
+						ctx: ctx, cMsgList: buffer[split*(len(buffer)/split):],
+					}}
+				}
+
+				log.ZDebug(ctx, "timer trigger msg consumer end",
+					"length", len(buffer), "time_cost", time.Since(start),
+				)
 			}
 		}
 	}()
-	for msg := range claim.Messages() {
-		rwLock.Lock()
-		if len(msg.Value) != 0 {
-			cMsg = append(cMsg, msg)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for running.Load() {
+			select {
+			case msg, ok := <-claim.Messages():
+				if !ok {
+					running.Store(false)
+					return
+				}
+
+				if len(msg.Value) == 0 {
+					continue
+				}
+
+				rwLock.Lock()
+				messages = append(messages, msg)
+				rwLock.Unlock()
+
+				sess.MarkMessage(msg, "")
+
+			case <-sess.Context().Done():
+				running.Store(false)
+				return
+			}
 		}
-		rwLock.Unlock()
-		sess.MarkMessage(msg, "")
-	}
+	}()
+
+	wg.Wait()
 	return nil
 }

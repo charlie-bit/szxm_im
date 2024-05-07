@@ -15,7 +15,7 @@
 package callbackstruct
 
 import (
-	sdkws "github.com/OpenIMSDK/protocol/sdkws"
+	sdkws "github.com/openimsdk/protocol/sdkws"
 )
 
 type CallbackBeforeSendSingleMsgReq struct {
@@ -78,4 +78,28 @@ type CallbackMsgModifyCommandResp struct {
 	MsgDataList      *[]byte                `json:"msgDataList"`
 	AttachedInfo     *string                `json:"attachedInfo"`
 	Ex               *string                `json:"ex"`
+}
+
+type CallbackGroupMsgReadReq struct {
+	CallbackCommand `json:"callbackCommand"`
+	SendID          string `json:"sendID"`
+	ReceiveID       string `json:"receiveID"`
+	UnreadMsgNum    int64  `json:"unreadMsgNum"`
+	ContentType     int64  `json:"contentType"`
+}
+
+type CallbackGroupMsgReadResp struct {
+	CommonCallbackResp
+}
+
+type CallbackSingleMsgReadReq struct {
+	CallbackCommand `json:"callbackCommand"`
+	ConversationID  string  `json:"conversationID"`
+	UserID          string  `json:"userID"`
+	Seqs            []int64 `json:"Seqs"`
+	ContentType     int32   `json:"contentType"`
+}
+
+type CallbackSingleMsgReadResp struct {
+	CommonCallbackResp
 }
