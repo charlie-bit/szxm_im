@@ -9,6 +9,9 @@ import (
 	"strings"
 )
 
+// export PLATFORMS="linux_arm64"
+// export PLATFORMS="darwin_arm64"
+
 var Default = Build
 
 func Build() {
